@@ -370,14 +370,42 @@ with st.sidebar:
     st.markdown(f"## {APP_ICON} {APP_TITLE}")
     st.caption(f"الإصدار {APP_VERSION}")
 
-    # حالة AI
+    # حالة AI — تشخيص مفصل
     ai_ok = bool(GEMINI_API_KEYS)
-    ai_color = "#00C853" if ai_ok else "#FF1744"
-    ai_label = f"🤖 Gemini ({len(GEMINI_API_KEYS)} مفتاح)" if ai_ok else "🔴 AI غير متصل"
-    st.markdown(f'<div style="background:{ai_color}22;border:1px solid {ai_color};'
-                f'border-radius:6px;padding:6px;text-align:center;color:{ai_color};'
-                f'font-weight:700;font-size:.85rem">{ai_label}</div>',
-                unsafe_allow_html=True)
+    if ai_ok:
+        ai_color = "#00C853"
+        ai_label = f"🤖 Gemini ✅ ({len(GEMINI_API_KEYS)} مفتاح)"
+    else:
+        ai_color = "#FF1744"
+        ai_label = "🔴 AI غير متصل — تحقق من Secrets"
+
+    st.markdown(
+        f'<div style="background:{ai_color}22;border:1px solid {ai_color};'
+        f'border-radius:6px;padding:6px;text-align:center;color:{ai_color};'
+        f'font-weight:700;font-size:.85rem">{ai_label}</div>',
+        unsafe_allow_html=True
+    )
+
+    # زر تشخيص سريع
+    if not ai_ok:
+        if st.button("🔍 تشخيص المشكلة", key="diag_btn"):
+            import os
+            st.write("**الـ secrets المتاحة:**")
+            try:
+                available = list(st.secrets.keys())
+                for k in available:
+                    val = str(st.secrets[k])
+                    masked = val[:8] + "..." if len(val) > 8 else val
+                    st.write(f"  `{k}` = `{masked}`")
+            except Exception as e:
+                st.error(f"خطأ: {e}")
+            # محاولة مباشرة
+            for key_name in ["GEMINI_API_KEYS","GEMINI_API_KEY","GEMINI_KEY_1"]:
+                try:
+                    v = st.secrets[key_name]
+                    st.success(f"✅ وجدت {key_name} = {str(v)[:20]}...")
+                except:
+                    st.warning(f"❌ {key_name} غير موجود")
 
     # حالة المعالجة
     if st.session_state.job_id:
