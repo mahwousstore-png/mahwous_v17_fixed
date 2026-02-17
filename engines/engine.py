@@ -136,6 +136,12 @@ def find_best_match(our_product, comp_products, comp_names_col=None):
     our_brand = extract_brand(our_product)
     our_size = extract_size(our_product)
 
+    # عمود معرف المنتج لدى المنافس
+    comp_id_col = None
+    for c in ["ID","id","معرف","رقم المنتج","product_id","SKU","sku","barcode","باركود","الكود","code"]:
+        if c in comp_products.columns:
+            comp_id_col = c; break
+
     all_matches = []
     for idx, row in comp_products.iterrows():
         comp_name = str(row.get(comp_names_col, ""))
@@ -157,10 +163,12 @@ def find_best_match(our_product, comp_products, comp_names_col=None):
                     try: price = float(row[pc])
                     except: pass
                     break
+            comp_pid = str(row.get(comp_id_col, "")) if comp_id_col else ""
             all_matches.append({
                 "name": comp_name, "score": score,
                 "price": price, "idx": idx,
-                "brand": comp_brand, "size": comp_size
+                "brand": comp_brand, "size": comp_size,
+                "product_id": comp_pid
             })
 
     if not all_matches: return None
@@ -240,6 +248,7 @@ def run_full_analysis(our_df, comp_dfs, progress_callback=None):
                 "المنتج": product, "السعر": our_price,
                 "الماركة": brand, "الحجم": size, "النوع": ptype,
                 "منتج المنافس": best["name"],
+                "معرف المنافس": best.get("product_id", ""),
                 "سعر المنافس": min_price_match["price"],
                 "الفرق": round(diff, 2),
                 "نسبة التطابق": best["score"],
@@ -314,8 +323,15 @@ def find_missing_products(our_df, comp_dfs):
                         try: price = float(row[pc])
                         except: pass
                         break
+                # معرف المنتج لدى المنافس
+                comp_id_c2 = None
+                for idc in ["ID","id","معرف","رقم المنتج","product_id","SKU","sku","barcode","باركود","الكود","code"]:
+                    if idc in comp_df.columns:
+                        comp_id_c2 = idc; break
+                comp_pid2 = str(row.get(comp_id_c2, "")) if comp_id_c2 else ""
                 missing.append({
                     "منتج المنافس": cp,
+                    "معرف المنافس": comp_pid2,
                     "سعر المنافس": price,
                     "المنافس": comp_name,
                     "الماركة": extract_brand(cp),
