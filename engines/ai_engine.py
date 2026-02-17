@@ -1,367 +1,312 @@
 """
-engines/ai_engine.py - v18.0
-- Gemini Flash مباشر + OpenRouter fallback
-- بحث ويب لأسعار السوق والمنافسين
-- بحث في mahwous.com للمنتجات المفقودة
-- تدريب مخصص لكل صفحة
-- Gemini Chat مدمج (تجربة Gemini نقية)
+engines/ai_engine.py v19.0
+- Gemini مباشر + Grounding (بحث حقيقي)
+- fragranticarabia.com → صور + مكونات العطور
+- Mahwous وصف خاص للمنتجات المفقودة
+- تحقق منتج | بحث سوق | تحليل مجمع | دردشة
 """
-import requests, json, re
-from config import GEMINI_API_KEYS, OPENROUTER_API_KEY
+import requests, json, re, time
+from config import GEMINI_API_KEYS, OPENROUTER_API_KEY, COHERE_API_KEY
 
-GEMINI_MODEL   = "gemini-2.0-flash"
-GEMINI_BASE    = "https://generativelanguage.googleapis.com/v1beta/models"
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-OPENROUTER_MODEL = "google/gemini-2.0-flash-001"
+_GM  = "gemini-2.0-flash"
+_GU  = f"https://generativelanguage.googleapis.com/v1beta/models/{_GM}:generateContent"
+_GUS = f"https://generativelanguage.googleapis.com/v1beta/models/{_GM}:streamGenerateContent"
+_OR  = "https://openrouter.ai/api/v1/chat/completions"
+_CO  = "https://api.cohere.ai/v1/generate"
+_FR  = "https://www.fragranticarabia.com"
 
-# ══════════════════════════════════════════
-#  System Prompts مخصصة لكل صفحة (تدريب)
-# ══════════════════════════════════════════
+# ══ System Prompts مخصصة لكل قسم ══════════════
 PAGE_PROMPTS = {
-
-    "price_raise": """أنت خبير تسعير عطور فاخرة في السوق السعودي — متخصص في تحليل المنتجات ذات السعر الأعلى من المنافسين.
-
-سياق عملك:
-• سعرنا أعلى من المنافس → خطر فقدان المبيعات
-• قواعد القرار:
-  - فرق < 10 ر.س: إبقاء (طبيعي)
-  - فرق 10–30 ر.س: مراجعة مع المسؤول
-  - فرق > 30 ر.س: خفض فوري
-
-لكل منتج قيّم:
-1. هل المطابقة صحيحة 100%؟ (ماركة + حجم + نوع EDP/EDT)
-2. هل فرق السعر مبرر؟ (حصرية، عرض خاص، جودة أعلى)
-3. توصيتك: خفض/إبقاء/مراجعة + السعر المقترح
-أجب بالعربية مختصراً.""",
-
-    "price_lower": """أنت خبير تسعير عطور فاخرة — متخصص في اكتشاف فرص رفع الأسعار.
-
-سياق عملك:
-• سعرنا أقل من المنافس → فرصة ربح ضائعة
-• قواعد القرار:
-  - فرق < 10 ر.س: إبقاء (ميزة تنافسية)
-  - فرق 10–50 ر.س: رفع تدريجي
-  - فرق > 50 ر.س: رفع فوري للسعر
-
-لكل منتج قيّم:
-1. هل يمكن رفع السعر دون خسارة مبيعات؟
-2. ما السعر الأمثل لزيادة الهامش؟
-3. توصيتك: رفع/إبقاء + السعر المقترح
-أجب بالعربية مختصراً.""",
-
-    "approved": """أنت خبير تسعير عطور — تراجع المنتجات الموافق عليها للتأكد من استمرار صلاحيتها.
-
-مهمتك:
-• تأكيد أن التطابق لا يزال صحيحاً
-• التحقق أن السعر لا يزال تنافسياً
-• تنبيه إذا تغيرت ظروف السوق
-أجب بالعربية مختصراً.""",
-
-    "missing": """أنت خبير عطور فاخرة ومحلل سوق — تحقق من المنتجات المفقودة عند متجر مهووس.
-
-مهمتك الأساسية:
-1. هل المنتج حقيقي وموثوق في السوق؟
-2. هل يستحق إضافته لمتجر مهووس؟
-3. هل قد يكون مكرراً بإسم مختلف في متجرنا؟
-4. السعر المقترح بناءً على السوق السعودي
-5. درجة الأولوية للإضافة: عالية/متوسطة/منخفضة
-أجب بالعربية مختصراً.""",
-
-    "review": """أنت خبير تسعير عطور — تحكّم في المنتجات ذات التطابق غير المؤكد.
-
-مهمتك:
-1. هل المنتجان متطابقان فعلاً؟ (احذر الاسم المختلف لنفس العطر)
-2. إذا متطابقان → اقترح القسم الصحيح
-3. إذا غير متطابقان → إزالة من القائمة
-قرارك: ✅ نقل لموافق / 📉 نقل لمخفض / 🔴 نقل لأعلى / 🗑️ إزالة
-أجب بالعربية مختصراً.""",
-
-    "general": """أنت مساعد ذكاء اصطناعي متخصص في تسعير العطور الفاخرة في السوق السعودي.
-خبرتك: تحليل الأسعار، المنافسة، استراتيجيات التسعير، سوق العطور.
-أجب بالعربية باحترافية وإيجاز.""",
-
-    "verify": """أنت خبير تحقق من منتجات العطور الفاخرة.
-تحقق من:
-1. التطابق الحرفي: ماركة + اسم العطر + حجم ML + نوع EDP/EDT
-2. السعر المنطقي في السوق السعودي
-3. درجة الثقة بالتطابق
-
-أجب JSON فقط بدون أي نص:
-{"match": true/false, "confidence": 0-100, "reason": "سبب مختصر", "suggestion": "توصية", "market_price": 0}""",
-
-    "market_search": """أنت محلل أسعار عطور. بناءً على معرفتك بالسوق السعودي:
-قدّر سعر السوق الحالي، نطاق الأسعار، ومقارنة بأهم المنافسين.
-أجب JSON:
-{"market_price": 0, "price_range": {"min": 0, "max": 0}, "competitors": [{"name": "", "price": 0}], "recommendation": ""}""",
-
-    "mahwous_search": """أنت خبير في منتجات متجر مهووس للعطور السعودي.
-حلّل إذا كان هذا المنتج متوفراً في مهووس.com بناءً على معرفتك، أو إذا كان يحتاج إضافة.
-أجب JSON:
-{"likely_available": true/false, "confidence": 0-100, "similar_products": [], "add_recommendation": ""}"""
+"price_raise": """أنت خبير تسعير عطور فاخرة (السوق السعودي) — قسم «سعر أعلى».
+سعرنا أعلى من المنافس. قواعد: فرق<10 → إبقاء | 10-30 → مراجعة | >30 → خفض فوري.
+لكل منتج: 1.هل المطابقة صحيحة؟ 2.هل الفرق مبرر؟ 3.السعر المقترح.
+أجب بالعربية بإيجاز واحترافية.""",
+"price_lower": """أنت خبير تسعير عطور فاخرة (السوق السعودي) — قسم «سعر أقل».
+سعرنا أقل من المنافس = فرصة ربح ضائعة. فرق<10 → إبقاء | 10-50 → رفع تدريجي | >50 → رفع فوري.
+لكل منتج: 1.هل يمكن رفع السعر؟ 2.السعر الأمثل. أجب بالعربية بإيجاز.""",
+"approved": "أنت خبير تسعير عطور. راجع المنتجات الموافق عليها وتأكد من استمرار صلاحيتها. أجب بالعربية.",
+"missing": """أنت خبير عطور فاخرة — متخصص في المنتجات المفقودة بمتجر مهووس.
+لكل منتج: 1.هل هو حقيقي وموثوق؟ 2.هل يستحق الإضافة؟ 3.السعر المقترح. 4.أولوية الإضافة (عالية/متوسطة/منخفضة). أجب بالعربية.""",
+"review": "أنت خبير تسعير عطور. قرّر: ✅موافق / 📉مخفض / 🔴أعلى / 🗑️إزالة. أجب بالعربية.",
+"general": """أنت مساعد ذكاء اصطناعي متخصص في تسعير العطور الفاخرة والسوق السعودي.
+خبرتك: تحليل الأسعار، المنافسة، استراتيجيات التسعير، مكونات العطور ومراكز الرائحة.
+أجب بالعربية باحترافية وإيجاز — يمكنك استخدام الـ markdown.""",
+"verify": """أنت خبير تحقق من منتجات العطور.
+أجب JSON فقط: {"match":true/false,"confidence":0-100,"reason":"","suggestion":"","market_price":0}""",
+"market_search": """أنت محلل أسعار عطور (السوق السعودي).
+أجب JSON: {"market_price":0,"price_range":{"min":0,"max":0},"competitors":[{"name":"","price":0}],"recommendation":""}""",
 }
 
-
-# ══════════════════════════════════════════
-#  استدعاء Gemini
-# ══════════════════════════════════════════
-def _call_gemini(prompt, system_prompt="", use_grounding=False):
-    """استدعاء Gemini مع تجربة جميع المفاتيح"""
-    full = f"{system_prompt}\n\n{prompt}" if system_prompt else prompt
+# ══ استدعاء Gemini ══════════════════════════
+def _call_gemini(prompt, system="", grounding=False, stream=False):
+    full = f"{system}\n\n{prompt}" if system else prompt
     payload = {
         "contents": [{"parts": [{"text": full}]}],
-        "generationConfig": {
-            "temperature": 0.3,
-            "maxOutputTokens": 2048,
-            "topP": 0.8
-        }
+        "generationConfig": {"temperature": 0.3, "maxOutputTokens": 4096, "topP": 0.85}
     }
-
-    # تفعيل Google Search Grounding (بحث حقيقي)
-    if use_grounding:
+    if grounding:
         payload["tools"] = [{"google_search": {}}]
 
     for key in GEMINI_API_KEYS:
         if not key: continue
         try:
-            url = f"{GEMINI_BASE}/{GEMINI_MODEL}:generateContent?key={key}"
-            resp = requests.post(url, json=payload, timeout=30)
-            if resp.status_code == 200:
-                data = resp.json()
-                if "candidates" in data and data["candidates"]:
-                    return data["candidates"][0]["content"]["parts"][0]["text"]
-            elif resp.status_code == 429:
-                continue
+            r = requests.post(f"{_GU}?key={key}", json=payload, timeout=35)
+            if r.status_code == 200:
+                data = r.json()
+                if data.get("candidates"):
+                    parts = data["candidates"][0]["content"]["parts"]
+                    return "".join(p.get("text","") for p in parts)
+            elif r.status_code == 429:
+                time.sleep(1); continue
         except: continue
     return None
 
-
-def _call_openrouter(prompt, system_prompt=""):
+def _call_openrouter(prompt, system=""):
     if not OPENROUTER_API_KEY: return None
     try:
-        headers = {
-            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-            "Content-Type": "application/json"
-        }
         msgs = []
-        if system_prompt: msgs.append({"role": "system", "content": system_prompt})
-        msgs.append({"role": "user", "content": prompt})
-        resp = requests.post(OPENROUTER_URL, json={
-            "model": OPENROUTER_MODEL, "messages": msgs,
-            "temperature": 0.3, "max_tokens": 2048
-        }, headers=headers, timeout=30)
-        if resp.status_code == 200:
-            return resp.json()["choices"][0]["message"]["content"]
+        if system: msgs.append({"role":"system","content":system})
+        msgs.append({"role":"user","content":prompt})
+        r = requests.post(_OR, json={
+            "model":"google/gemini-2.0-flash-001",
+            "messages":msgs,"temperature":0.3,"max_tokens":4096
+        }, headers={"Authorization":f"Bearer {OPENROUTER_API_KEY}"}, timeout=35)
+        if r.status_code == 200:
+            return r.json()["choices"][0]["message"]["content"]
     except: pass
     return None
 
+def _call_cohere(prompt, system=""):
+    if not COHERE_API_KEY: return None
+    try:
+        full = f"{system}\n\n{prompt}" if system else prompt
+        r = requests.post(_CO, json={
+            "model":"command-r-plus","prompt":full,"max_tokens":4096,"temperature":0.3
+        }, headers={"Authorization":f"Bearer {COHERE_API_KEY}"}, timeout=35)
+        if r.status_code == 200:
+            return r.json().get("generations",[{}])[0].get("text","")
+    except: pass
+    return None
 
 def call_ai(prompt, page="general"):
-    """استدعاء AI مع fallback"""
-    system = PAGE_PROMPTS.get(page, PAGE_PROMPTS["general"])
-    result = _call_gemini(prompt, system)
-    if result:
-        return {"success": True, "response": result, "source": "Gemini"}
-    result = _call_openrouter(prompt, system)
-    if result:
-        return {"success": True, "response": result, "source": "OpenRouter"}
-    return {"success": False, "response": "فشل الاتصال. تحقق من مفاتيح API.", "source": "none"}
+    sys = PAGE_PROMPTS.get(page, PAGE_PROMPTS["general"])
+    for fn in [lambda: _call_gemini(prompt, sys),
+               lambda: _call_openrouter(prompt, sys),
+               lambda: _call_cohere(prompt, sys)]:
+        r = fn()
+        if r: return {"success":True,"response":r,"source":fn.__name__ if hasattr(fn,"__name__") else "AI"}
+    # fallback source names
+    for r, src in [(_call_gemini(prompt,sys),"Gemini"),
+                   (_call_openrouter(prompt,sys),"OpenRouter"),
+                   (_call_cohere(prompt,sys),"Cohere")]:
+        if r: return {"success":True,"response":r,"source":src}
+    return {"success":False,"response":"❌ فشل الاتصال بجميع مزودي AI","source":"none"}
 
-
-# ══════════════════════════════════════════
-#  Gemini Chat (تجربة نقية)
-# ══════════════════════════════════════════
-def gemini_chat(message, history=None):
-    """
-    دردشة Gemini مباشرة مع تاريخ المحادثة
-    يُستخدم في قسم الذكاء الاصطناعي كتجربة Gemini خالصة
-    """
-    if not GEMINI_API_KEYS:
-        return {"success": False, "response": "لم يتم إعداد مفتاح Gemini"}
+# ══ Gemini Chat مع History ══════════════════
+def gemini_chat(message, history=None, system_extra=""):
+    """دردشة Gemini مع كامل تاريخ المحادثة"""
+    sys = PAGE_PROMPTS["general"]
+    if system_extra:
+        sys = f"{sys}\n\nسياق إضافي: {system_extra}"
 
     contents = []
-    if history:
-        for h in history[-8:]:
-            contents.append({"role": "user", "parts": [{"text": h["user"]}]})
-            contents.append({"role": "model", "parts": [{"text": h["ai"]}]})
-    contents.append({"role": "user", "parts": [{"text": message}]})
+    for h in (history or [])[-12:]:
+        contents.append({"role":"user","parts":[{"text":h["user"]}]})
+        contents.append({"role":"model","parts":[{"text":h["ai"]}]})
+    contents.append({"role":"user","parts":[{"text":f"{sys}\n\n{message}"}]})
 
-    system = PAGE_PROMPTS["general"]
-    payload = {
-        "system_instruction": {"parts": [{"text": system}]},
-        "contents": contents,
-        "generationConfig": {"temperature": 0.4, "maxOutputTokens": 2048}
-    }
+    payload = {"contents":contents,
+               "generationConfig":{"temperature":0.4,"maxOutputTokens":4096,"topP":0.9}}
 
     for key in GEMINI_API_KEYS:
         if not key: continue
         try:
-            url = f"{GEMINI_BASE}/{GEMINI_MODEL}:generateContent?key={key}"
-            resp = requests.post(url, json=payload, timeout=30)
-            if resp.status_code == 200:
-                data = resp.json()
-                text = data["candidates"][0]["content"]["parts"][0]["text"]
-                return {"success": True, "response": text, "source": "Gemini Flash"}
+            r = requests.post(f"{_GU}?key={key}", json=payload, timeout=40)
+            if r.status_code == 200:
+                data = r.json()
+                if data.get("candidates"):
+                    text = data["candidates"][0]["content"]["parts"][0]["text"]
+                    return {"success":True,"response":text,"source":"Gemini Flash"}
+            elif r.status_code == 429:
+                time.sleep(1); continue
         except: continue
 
-    return {"success": False, "response": "فشل الاتصال بـ Gemini"}
+    r = _call_openrouter(message, sys)
+    if r: return {"success":True,"response":r,"source":"OpenRouter"}
+    return {"success":False,"response":"❌ فشل الاتصال","source":"none"}
 
+# ══ تحقق منتج ═══════════════════════════════
+def verify_match(p1, p2, pr1=0, pr2=0):
+    prompt = f"""تحقق من تطابق هذين المنتجين:
+منتج 1: {p1} | السعر: {pr1:.0f} ر.س
+منتج 2: {p2} | السعر: {pr2:.0f} ر.س
+هل هما نفس العطر؟ (ماركة + اسم + حجم + نوع EDP/EDT)"""
+    sys = PAGE_PROMPTS["verify"]
+    txt = _call_gemini(prompt, sys) or _call_openrouter(prompt, sys)
+    if not txt: return {"success":False,"match":False,"confidence":0,"reason":"فشل AI"}
+    try:
+        clean = re.sub(r'```json|```','',txt).strip()
+        s=clean.find('{'); e=clean.rfind('}')+1
+        data = json.loads(clean[s:e])
+        return {"success":True, **data}
+    except:
+        return {"success":True,"match":"true" in txt.lower(),"confidence":70,"reason":txt[:200]}
 
-def chat_with_ai(message, history=None, page="general"):
-    context = ""
-    if history:
-        for h in history[-5:]:
-            context += f"المستخدم: {h['user']}\nAI: {h['ai']}\n"
-    full = f"{context}\nالمستخدم: {message}" if context else message
-    return call_ai(full, page)
+# ══ بحث أسعار السوق ═════════════════════════
+def search_market_price(product_name, our_price=0):
+    prompt = (f"ما هو سعر السوق السعودي الحالي لـ: «{product_name}»؟\n"
+              f"سعرنا الحالي: {our_price:.0f} ر.س\n"
+              "اذكر: سعر السوق، نطاق الأسعار، أهم 3 منافسين وأسعارهم، توصيتك.")
+    sys = PAGE_PROMPTS["market_search"]
+    txt = _call_gemini(prompt, sys, grounding=True) or _call_gemini(prompt, sys) or _call_openrouter(prompt, sys)
+    if not txt: return {"success":False,"market_price":0}
+    try:
+        clean = re.sub(r'```json|```','',txt).strip()
+        s=clean.find('{'); e=clean.rfind('}')+1
+        if s>=0 and e>s:
+            return {"success":True, **json.loads(clean[s:e])}
+    except: pass
+    return {"success":True,"market_price":our_price,"recommendation":txt[:300]}
 
-
-# ══════════════════════════════════════════
-#  بحث أسعار السوق (Grounding)
-# ══════════════════════════════════════════
-def search_market_price(product_name, current_price=0):
+# ══ بحث صورة ومكونات من Fragrantica Arabia ══
+def fetch_fragrantica_info(product_name):
     """
-    يبحث عن سعر السوق الحقيقي باستخدام Gemini Grounding
+    يبحث عن صورة + مكونات العطر من Fragrantica Arabia
+    يستخدم Gemini Grounding للوصول للموقع
     """
-    prompt = f"""ابحث عن سعر هذا العطر في السوق السعودي الآن:
-المنتج: {product_name}
-سعرنا الحالي: {current_price} ر.س
+    prompt = f"""ابحث عن العطر «{product_name}» في موقع https://www.fragranticarabia.com
 
-أعطني:
-1. سعر السوق المتوقع في السعودية
-2. نطاق الأسعار (أدنى - أعلى)
-3. أسعار أهم المنافسين في السوق السعودي
-4. توصيتك لسعرنا
+أحتاج:
+1. رابط صورة المنتج (image URL)
+2. مكونات العطر (Top notes, Middle notes, Base notes)
+3. وصف قصير للعطر بالعربية
+4. الماركة والنوع (EDP/EDT) والحجم
 
 أجب JSON فقط:
-{{"market_price": 0, "price_range": {{"min": 0, "max": 0}},
-  "competitors": [{{"name": "", "price": 0}}],
-  "recommendation": "", "confidence": 0}}"""
+{{
+  "image_url": "رابط الصورة أو فارغ",
+  "top_notes": ["مكون1","مكون2"],
+  "middle_notes": ["مكون1","مكون2"],
+  "base_notes": ["مكون1","مكون2"],
+  "description_ar": "وصف قصير بالعربية",
+  "brand": "",
+  "type": "",
+  "fragrantica_url": "رابط الصفحة"
+}}"""
 
-    # محاولة مع Grounding أولاً
-    system = PAGE_PROMPTS["market_search"]
-    result = _call_gemini(prompt, system, use_grounding=True)
-    if not result:
-        result = _call_gemini(prompt, system, use_grounding=False)
-    if not result:
-        result = _call_openrouter(prompt, system)
+    txt = _call_gemini(prompt, grounding=True)
+    if not txt:
+        txt = _call_gemini(prompt)
+    if not txt:
+        return {"success":False}
+    try:
+        clean = re.sub(r'```json|```','',txt).strip()
+        s=clean.find('{'); e=clean.rfind('}')+1
+        if s>=0 and e>s:
+            data = json.loads(clean[s:e])
+            return {"success":True, **data}
+    except: pass
+    return {"success":False,"description_ar":txt[:200] if txt else ""}
 
-    if result:
-        try:
-            clean = re.sub(r'```json|```', '', result).strip()
-            start = clean.find('{'); end = clean.rfind('}') + 1
-            if start >= 0 and end > start:
-                data = json.loads(clean[start:end])
-                return {"success": True, **data, "raw": result}
-        except:
-            pass
-        return {"success": True, "raw": result, "market_price": 0,
-                "price_range": {"min": 0, "max": 0}, "competitors": [],
-                "recommendation": result[:200]}
+# ══ وصف مهووس للمنتجات المفقودة ════════════
+def generate_mahwous_description(product_name, price, fragrantica_data=None):
+    """
+    يولّد وصفاً بتنسيق مهووس الاحترافي:
+    اسم العطر، الماركة، المكونات، الوصف الشعري، السعر المقترح
+    """
+    frag_info = ""
+    if fragrantica_data and fragrantica_data.get("success"):
+        top = ", ".join(fragrantica_data.get("top_notes",[])[:4])
+        mid = ", ".join(fragrantica_data.get("middle_notes",[])[:4])
+        base = ", ".join(fragrantica_data.get("base_notes",[])[:4])
+        desc = fragrantica_data.get("description_ar","")
+        frag_info = f"\nالمكونات - قمة: {top} | قلب: {mid} | قاعدة: {base}\nوصف: {desc}"
 
-    return {"success": False, "raw": "فشل البحث"}
+    prompt = f"""اكتب وصفاً احترافياً وجذاباً لهذا العطر بتنسيق متجر مهووس:
 
+العطر: {product_name}
+السعر: {price:.0f} ر.س{frag_info}
 
+التنسيق المطلوب (اتبعه بدقة):
+---
+🌟 [اسم العطر الكامل]
+
+✨ [جملة تسويقية جذابة بالعربية - سطر واحد]
+
+📝 [فقرة وصف شعري 2-3 جمل تصف رائحة العطر وأجواءه]
+
+🌸 مكونات العطر:
+• القمة: [المكونات]
+• القلب: [المكونات]
+• القاعدة: [المكونات]
+
+👤 مناسب لـ: [الجنس] | 🕐 المناسبة: [النهار/المساء/المختلطة]
+
+💰 السعر: {price:.0f} ر.س
+---
+أجب بالعربية فقط."""
+
+    txt = _call_gemini(prompt) or _call_openrouter(prompt) or _call_cohere(prompt)
+    return txt or f"🌟 {product_name}\n💰 السعر: {price:.0f} ر.س"
+
+# ══ بحث mahwous.com ══════════════════════════
 def search_mahwous(product_name):
-    """
-    يتحقق إذا كان المنتج متوفراً في مهووس.com
-    باستخدام Gemini مع Grounding أو معرفته المدمجة
-    """
-    prompt = f"""تحقق إذا كان هذا المنتج متوفراً في موقع مهووس.com السعودي للعطور:
-المنتج: {product_name}
+    prompt = f"""هل العطر «{product_name}» متوفر في متجر مهووس؟
+أجب JSON: {{"likely_available":true/false,"confidence":0-100,
+"similar_products":[],"add_recommendation":"عالية/متوسطة/منخفضة",
+"reason":"سبب مختصر","suggested_price":0}}"""
+    txt = _call_gemini(prompt, grounding=True) or _call_gemini(prompt)
+    if not txt: return {"success":False}
+    try:
+        clean = re.sub(r'```json|```','',txt).strip()
+        s=clean.find('{'); e=clean.rfind('}')+1
+        if s>=0 and e>s:
+            return {"success":True, **json.loads(clean[s:e])}
+    except: pass
+    return {"success":True,"likely_available":False,"confidence":50,"reason":txt[:150]}
 
-ابحث في:
-1. موقع mahwous.com
-2. قواعد بياناتك عن منتجات مهووس
+# ══ تحقق مكرر ═══════════════════════════════
+def check_duplicate(product_name, our_products):
+    if not our_products:
+        return {"success":True,"response":"لا توجد بيانات للمقارنة"}
+    sample = our_products[:30]
+    prompt = f"""هل العطر «{product_name}» موجود بشكل مشابه في هذه القائمة؟
+القائمة: {', '.join(str(p) for p in sample)}
+أجب: نعم (وذكر أقرب مطابقة) أو لا."""
+    r = call_ai(prompt, "missing")
+    return r
 
-هل هو متوفر؟ هل يوجد منتج مشابه؟ هل ينصح بإضافته؟
+# ══ تحليل مجمع ══════════════════════════════
+def bulk_verify(items, section="general"):
+    if not items: return {"success":False,"response":"لا توجد منتجات"}
+    lines = "\n".join(
+        f"{i+1}. {it.get('our','')} ↔ {it.get('comp','')} | "
+        f"سعرنا: {it.get('our_price',0):.0f} | منافس: {it.get('comp_price',0):.0f} | "
+        f"فرق: {it.get('our_price',0)-it.get('comp_price',0):+.0f}"
+        for i,it in enumerate(items)
+    )
+    prompt = f"حلّل هذه المنتجات وأعطِ توصية لكل منها:\n{lines}"
+    return call_ai(prompt, section)
 
-أجب JSON فقط:
-{{"likely_available": false, "confidence": 0,
-  "similar_in_mahwous": [], "url": "",
-  "add_recommendation": "عالية/متوسطة/منخفضة",
-  "reason": ""}}"""
+# ══ معالجة النص الملصوق ═════════════════════
+def analyze_paste(text, context=""):
+    """تحليل نص ملصوق من Excel أو أي مصدر"""
+    prompt = f"""المستخدم لصق هذا النص:{chr(10) + context if context else ''}
 
-    system = PAGE_PROMPTS["mahwous_search"]
-    result = _call_gemini(prompt, system, use_grounding=True)
-    if not result:
-        result = _call_gemini(prompt, system, use_grounding=False)
-    if not result:
-        result = _call_openrouter(prompt, system)
+---
+{text[:5000]}
+---
 
-    if result:
-        try:
-            clean = re.sub(r'```json|```', '', result).strip()
-            start = clean.find('{'); end = clean.rfind('}') + 1
-            if start >= 0 and end > start:
-                return {"success": True, **json.loads(clean[start:end])}
-        except:
-            pass
-        return {"success": True, "raw": result, "likely_available": False,
-                "confidence": 0, "add_recommendation": "غير محدد", "reason": result[:200]}
-
-    return {"success": False, "reason": "فشل البحث"}
-
-
-# ══════════════════════════════════════════
-#  دوال التحقق الأخرى
-# ══════════════════════════════════════════
-def verify_match(our_product, comp_product, our_price=0, comp_price=0):
-    prompt = f"""تحقق من تطابق:
-منتجنا: {our_product} (السعر: {our_price} ر.س)
-المنافس: {comp_product} (السعر: {comp_price} ر.س)
-هل هما نفس المنتج؟ أجب JSON فقط."""
-    result = call_ai(prompt, "verify")
-    if result["success"]:
-        try:
-            text = result["response"]
-            clean = re.sub(r'```json|```', '', text).strip()
-            s = clean.find('{'); e = clean.rfind('}') + 1
-            if s >= 0 and e > s:
-                parsed = json.loads(clean[s:e])
-                return {"success": True, **parsed, "source": result["source"]}
-        except: pass
-        return {"success": True, "match": None, "confidence": 0,
-                "reason": result["response"][:300], "source": result["source"]}
-    return {"success": False, "match": None, "confidence": 0, "reason": "فشل الاتصال"}
-
-
-def analyze_product(product_name, price=0, context=""):
-    prompt = f"""حلّل: {product_name} | السعر: {price} ر.س | {context}
-أعطني: الماركة، الحجم، النوع، تقييم السعر، توصية."""
+حلّل هذا النص واستخرج:
+1. هل هو قائمة منتجات؟ إذا نعم، اعرضها بشكل منظم
+2. إذا كانت أسعار، حللها وقارنها
+3. إذا كانت أوامر، نفذها وأخبر بالنتيجة
+4. أعطِ توصيات مفيدة بناءً على البيانات
+أجب بالعربية بشكل منظم."""
     return call_ai(prompt, "general")
 
-
-def bulk_verify(products_list, page="review"):
-    if not products_list:
-        return {"success": False, "response": "لا توجد منتجات"}
-    items = []
-    for i, p in enumerate(products_list[:20]):
-        items.append(
-            f"{i+1}. منتجنا: {p.get('our','')} ({p.get('our_price',0)} ر.س)"
-            f" ↔ المنافس: {p.get('comp','')} ({p.get('comp_price',0)} ر.س)"
-        )
-    prompt = f"""تحقق من هذه المطابقات:\n{chr(10).join(items)}
-لكل منتج: ✅ صحيح / ❌ خطأ / ⚠️ غير متأكد + السبب"""
-    return call_ai(prompt, page)
-
-
-def suggest_price(product_name, current_price, comp_prices):
-    prices_text = ", ".join([f"{p} ر.س" for p in comp_prices if p > 0])
-    prompt = f"""اقترح سعر مناسب:
-المنتج: {product_name} | سعرنا: {current_price} ر.س | المنافسين: {prices_text}
-أعطني السعر المقترح مع التبرير."""
-    return call_ai(prompt, "general")
-
-
-def process_paste(text, page="general"):
-    prompt = f"""المستخدم لصق:\n---\n{text[:3000]}\n---\nحلّل وأعطِ النتائج."""
-    return call_ai(prompt, "paste" if "paste" in PAGE_PROMPTS else "general")
-
-
-def check_duplicate(product_name, existing_products):
-    products_text = "\n".join(str(p) for p in existing_products[:50])
-    prompt = f"""هل هذا المنتج موجود بالفعل (ربما باسم مختلف)؟
-المنتج: {product_name}
-القائمة:\n{products_text}
-أجب: موجود/غير موجود + الاسم المطابق إن وجد."""
-    return call_ai(prompt, "missing")
+# ══ دوال متوافقة مع app.py القديم ══════════
+def chat_with_ai(msg, history=None, ctx=""): return gemini_chat(msg, history, ctx)
+def analyze_product(p, price=0): return call_ai(f"حلّل: {p} ({price:.0f}ر.س)", "general")
+def suggest_price(p, comp_price): return call_ai(f"اقترح سعراً لـ {p} بدلاً من {comp_price:.0f}ر.س", "general")
+def process_paste(text): return analyze_paste(text)
