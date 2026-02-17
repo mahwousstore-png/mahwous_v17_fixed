@@ -1,417 +1,672 @@
 """
-نظام التسعير الذكي - مهووس v17.2
-- دعم CSV + Excel
-- مطابقة بصرية في كل الأقسام
-- AI يعمل فعلياً (Gemini + OpenRouter)
-- أزرار ذكية + Make + تصدير
+app.py - نظام التسعير الذكي مهووس v18.0
+✅ معالجة خلفية مع حفظ تلقائي
+✅ جداول مقارنة بصرية في كل الأقسام
+✅ أزرار AI + قرارات لكل منتج
+✅ بحث أسعار السوق والمنافسين
+✅ بحث mahwous.com للمنتجات المفقودة
+✅ تحديث تلقائي للأسعار عند إعادة رفع المنافس
+✅ تصدير Make لكل منتج وللمجموعات
+✅ Gemini Chat مباشر
+✅ فلاتر ذكية في كل قسم
+✅ تاريخ جميل لكل العمليات
 """
 import streamlit as st
 import pandas as pd
+import threading
+import time
+import uuid
+from datetime import datetime
+
 from config import *
 from styles import get_styles, stat_card, vs_card
 from engines.engine import (read_file, run_full_analysis, find_missing_products,
-                            export_excel, export_section_excel, is_sample,
-                            extract_brand, extract_size, extract_type)
-from engines.ai_engine import (call_ai, chat_with_ai, verify_match, analyze_product,
-                               bulk_verify, suggest_price, process_paste, check_duplicate)
+                             extract_brand, extract_size, extract_type, is_sample)
+from engines.ai_engine import (call_ai, gemini_chat, chat_with_ai,
+                                verify_match, analyze_product,
+                                bulk_verify, suggest_price,
+                                search_market_price, search_mahwous,
+                                check_duplicate, process_paste)
 from utils.helpers import (apply_filters, get_filter_options, export_to_excel,
-                           export_multiple_sheets, parse_pasted_text, safe_float,
-                           format_price, format_diff, BackgroundTask)
-from utils.make_helper import (send_price_updates, send_new_products, send_missing_products,
-                               send_to_make, send_single_product, verify_webhook_connection,
-                               export_to_make_format, test_webhook)
-from utils.db_manager import (init_db, log_event, log_decision, log_analysis,
-                              get_events, get_decisions, get_analysis_history)
+                            export_multiple_sheets, parse_pasted_text,
+                            safe_float, format_price, format_diff)
+from utils.make_helper import (send_price_updates, send_new_products,
+                                send_missing_products, send_single_product,
+                                verify_webhook_connection, export_to_make_format)
+from utils.db_manager import (init_db, log_event, log_decision,
+                               log_analysis, get_events, get_decisions,
+                               get_analysis_history, upsert_price_history,
+                               get_price_history, get_price_changes,
+                               save_job_progress, get_job_progress, get_last_job)
 
-# ===== إعداد الصفحة =====
-st.set_page_config(page_title=APP_TITLE, page_icon=APP_ICON, layout="wide", initial_sidebar_state="expanded")
+# ── إعداد الصفحة ──────────────────────────
+st.set_page_config(page_title=APP_TITLE, page_icon=APP_ICON,
+                   layout="wide", initial_sidebar_state="expanded")
 st.markdown(get_styles(), unsafe_allow_html=True)
 init_db()
 
-# ===== Session State =====
-for key in ["results", "missing_df", "analysis_df", "chat_history"]:
-    if key not in st.session_state:
-        st.session_state[key] = [] if key == "chat_history" else None
+# ── Session State ─────────────────────────
+_defaults = {
+    "results": None, "missing_df": None, "analysis_df": None,
+    "chat_history": [], "job_id": None, "job_running": False,
+    "decisions_pending": {},   # {product_name: action}
+}
+for k, v in _defaults.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
 
+
+# ── دوال مساعدة ───────────────────────────
 def db_log(page, action, details=""):
     try: log_event(page, action, details)
     except: pass
 
+def ts_badge(ts_str=""):
+    """شارة تاريخ مصغرة جميلة"""
+    if not ts_str:
+        ts_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+    return f'<span style="font-size:.65rem;color:#555;background:#1a1a2e;padding:1px 6px;border-radius:8px;margin-right:4px">🕐 {ts_str}</span>'
 
-# ===== الشريط الجانبي =====
-with st.sidebar:
-    st.markdown(f"## {APP_ICON} {APP_TITLE}")
-    st.caption(f"الإصدار {APP_VERSION}")
-    page = st.radio("الأقسام", SECTIONS, label_visibility="collapsed")
-    st.markdown("---")
-    if st.session_state.results is not None:
-        r = st.session_state.results
-        st.markdown("**📊 ملخص سريع:**")
-        st.caption(f"🔴 أعلى: {len(r.get('price_raise', pd.DataFrame()))}")
-        st.caption(f"🟢 أقل: {len(r.get('price_lower', pd.DataFrame()))}")
-        st.caption(f"✅ موافق: {len(r.get('approved', pd.DataFrame()))}")
-        st.caption(f"🔍 مفقود: {len(r.get('missing', pd.DataFrame()))}")
-        st.caption(f"⚠️ مراجعة: {len(r.get('review', pd.DataFrame()))}")
+def decision_badge(action):
+    colors = {
+        "approved": ("#00C853", "✅ موافق"),
+        "deferred": ("#FFD600", "⏸️ مؤجل"),
+        "removed":  ("#FF1744", "🗑️ محذوف"),
+    }
+    c, label = colors.get(action, ("#666", action))
+    return f'<span style="font-size:.7rem;color:{c};font-weight:700">{label}</span>'
 
 
-# ===== دوال العرض المشتركة =====
-def render_filters(df, prefix):
-    """عرض فلاتر متقدمة"""
+# ════════════════════════════════════════════════
+#  المعالجة الخلفية
+# ════════════════════════════════════════════════
+def _run_analysis_background(job_id, our_df, comp_dfs, our_file_name, comp_names):
+    """تعمل في thread منفصل — تحفظ التقدم كل 10 منتجات"""
+    total = len(our_df)
+    processed = 0
+    partial_results = []
+
+    def progress_cb(pct):
+        nonlocal processed
+        processed = int(pct * total)
+        if processed % 10 == 0 or processed >= total:
+            save_job_progress(job_id, total, processed,
+                              partial_results, "running",
+                              our_file_name, comp_names)
+
+    try:
+        analysis_df = run_full_analysis(our_df, comp_dfs,
+                                        progress_callback=progress_cb)
+        # حفظ تاريخ الأسعار
+        for _, row in analysis_df.iterrows():
+            if row.get("نسبة التطابق", 0) > 0:
+                upsert_price_history(
+                    str(row.get("المنتج", "")),
+                    str(row.get("المنافس", "")),
+                    safe_float(row.get("سعر المنافس", 0)),
+                    safe_float(row.get("السعر", 0)),
+                    safe_float(row.get("الفرق", 0)),
+                    safe_float(row.get("نسبة التطابق", 0)),
+                    str(row.get("القرار", ""))
+                )
+
+        missing_df = find_missing_products(our_df, comp_dfs)
+        results = {
+            "price_raise": analysis_df[analysis_df["القرار"].str.contains("أعلى", na=False)].reset_index(drop=True),
+            "price_lower": analysis_df[analysis_df["القرار"].str.contains("أقل",  na=False)].reset_index(drop=True),
+            "approved":    analysis_df[analysis_df["القرار"].str.contains("موافق",na=False)].reset_index(drop=True),
+            "review":      analysis_df[analysis_df["القرار"].str.contains("مراجعة",na=False)].reset_index(drop=True),
+            "missing": missing_df,
+            "all":     analysis_df,
+        }
+        save_job_progress(job_id, total, total,
+                          analysis_df.to_dict("records"),
+                          "done", our_file_name, comp_names)
+        log_analysis(our_file_name, comp_names, total,
+                     len(analysis_df[analysis_df["نسبة التطابق"] > 0]),
+                     len(missing_df))
+
+    except Exception as e:
+        save_job_progress(job_id, total, processed,
+                          [], f"error: {str(e)}", our_file_name, comp_names)
+
+
+# ════════════════════════════════════════════════
+#  مكوّن جدول المقارنة البصري (مشترك)
+# ════════════════════════════════════════════════
+def render_pro_table(df, prefix, section_type="update", show_search=True):
+    """
+    جدول احترافي بصري مع:
+    - فلاتر ذكية
+    - أزرار AI + قرار لكل منتج
+    - تصدير Make
+    - Pagination
+    """
+    if df is None or df.empty:
+        st.info("لا توجد منتجات")
+        return
+
+    # ── فلاتر ─────────────────────────────────
     opts = get_filter_options(df)
-    filters = {}
     with st.expander("🔍 فلاتر متقدمة", expanded=False):
         c1, c2, c3, c4 = st.columns(4)
-        filters["search"] = c1.text_input("🔎 بحث", key=f"{prefix}_search")
-        filters["brand"] = c2.selectbox("الماركة", opts["brands"], key=f"{prefix}_brand")
-        filters["competitor"] = c3.selectbox("المنافس", opts["competitors"], key=f"{prefix}_comp")
-        filters["type"] = c4.selectbox("النوع", opts["types"], key=f"{prefix}_type")
+        search   = c1.text_input("🔎 بحث",    key=f"{prefix}_s")
+        brand_f  = c2.selectbox("🏷️ الماركة", opts["brands"],      key=f"{prefix}_b")
+        comp_f   = c3.selectbox("🏪 المنافس", opts["competitors"], key=f"{prefix}_c")
+        type_f   = c4.selectbox("🧴 النوع",   opts["types"],       key=f"{prefix}_t")
         c5, c6, c7 = st.columns(3)
-        filters["match_min"] = c5.slider("أقل تطابق %", 0, 100, 0, key=f"{prefix}_match")
-        filters["price_min"] = c6.number_input("أقل سعر", 0.0, key=f"{prefix}_pmin")
-        filters["price_max"] = c7.number_input("أعلى سعر", 0.0, key=f"{prefix}_pmax")
-        if filters["price_max"] == 0: filters["price_max"] = None
-        if filters["match_min"] == 0: filters["match_min"] = None
-    return filters
+        match_min  = c5.slider("أقل تطابق%", 0, 100, 0, key=f"{prefix}_m")
+        price_min  = c6.number_input("سعر من", 0.0, key=f"{prefix}_p1")
+        price_max  = c7.number_input("سعر لـ", 0.0, key=f"{prefix}_p2")
 
+    filters = {
+        "search": search, "brand": brand_f, "competitor": comp_f,
+        "type": type_f,
+        "match_min": match_min if match_min > 0 else None,
+        "price_min": price_min if price_min > 0 else 0.0,
+        "price_max": price_max if price_max > 0 else None,
+    }
+    filtered = apply_filters(df, filters)
 
-def render_action_bar(df, prefix, section_type="update"):
-    """أزرار عامة لكل قسم: تصدير Excel + تحقق AI جماعي + تصدير Make"""
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        excel = export_to_excel(df, prefix)
-        st.download_button(
-            "📥 تصدير Excel", 
-            data=excel, 
-            file_name=f"{prefix}_{pd.Timestamp.now().strftime('%Y%m%d')}.xlsx",
+    # ── شريط الأدوات ───────────────────────────
+    ac1, ac2, ac3, ac4 = st.columns(4)
+    with ac1:
+        excel_data = export_to_excel(filtered, prefix)
+        st.download_button("📥 Excel", data=excel_data,
+            file_name=f"{prefix}_{datetime.now().strftime('%Y%m%d')}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            key=f"{prefix}_dl"
-        )
-    with c2:
-        if st.button("🤖 تحقق AI جماعي", key=f"{prefix}_bulk_ai"):
-            with st.spinner("جاري التحقق بالذكاء الصناعي..."):
-                items = []
-                for _, r in df.head(20).iterrows():
-                    items.append({
-                        "our": str(r.get("المنتج", "")),
-                        "comp": str(r.get("منتج المنافس", r.get("اسم المنافس", ""))),
-                        "our_price": safe_float(r.get("السعر", 0)),
-                        "comp_price": safe_float(r.get("سعر المنافس", r.get("أقل سعر منافس", 0)))
-                    })
-                result = bulk_verify(items, prefix)
-                if result["success"]:
-                    st.markdown(f'<div class="ai-box">{result["response"]}</div>', unsafe_allow_html=True)
-                else:
-                    st.error(result["response"])
-    with c3:
-        if st.button("📤 تصدير Make", key=f"{prefix}_make"):
-            products = export_to_make_format(df, section_type)
-            result = send_to_make(products, section_type)
-            if result["success"]:
-                st.success(result["message"])
-            else:
-                st.error(result["message"])
+            key=f"{prefix}_xl")
+    with ac2:
+        if st.button("🤖 AI جماعي (أول 20)", key=f"{prefix}_bulk"):
+            with st.spinner("🤖 AI يحلل..."):
+                items = [{
+                    "our": str(r.get("المنتج", "")),
+                    "comp": str(r.get("منتج المنافس", "")),
+                    "our_price": safe_float(r.get("السعر", 0)),
+                    "comp_price": safe_float(r.get("سعر المنافس", 0))
+                } for _, r in filtered.head(20).iterrows()]
+                res = bulk_verify(items, prefix)
+                st.markdown(f'<div class="ai-box">{res["response"]}</div>',
+                            unsafe_allow_html=True)
+    with ac3:
+        if st.button("📤 إرسال كل لـ Make", key=f"{prefix}_make_all"):
+            products = export_to_make_format(filtered, section_type)
+            res = send_price_updates(products) if section_type == "update" else send_new_products(products)
+            st.success(res["message"]) if res["success"] else st.error(res["message"])
+    with ac4:
+        # جمع القرارات المعلقة وإرسالها
+        pending = {k: v for k, v in st.session_state.decisions_pending.items()
+                   if v["action"] in ["approved", "deferred", "removed"]}
+        if pending and st.button(f"📦 ترحيل {len(pending)} قرار → Make", key=f"{prefix}_send_decisions"):
+            to_send = [{"name": k, "action": v["action"], "reason": v.get("reason", "")}
+                       for k, v in pending.items()]
+            res = send_price_updates(to_send)
+            st.success(f"✅ تم إرسال {len(to_send)} قرار لـ Make")
+            st.session_state.decisions_pending = {}
 
+    st.caption(f"عرض {len(filtered)} من {len(df)} منتج — {datetime.now().strftime('%H:%M:%S')}")
 
-def render_paste_section(prefix):
-    """خاصية لصق نتائج خارجية مع AI"""
-    with st.expander("📋 لصق بيانات / أوامر AI", expanded=False):
-        pasted = st.text_area("الصق هنا نتائج من Gemini أو أي مصدر:", key=f"{prefix}_paste", height=100)
-        c1, c2 = st.columns(2)
-        with c1:
-            if pasted and st.button("📊 تحليل", key=f"{prefix}_parse"):
-                df, msg = parse_pasted_text(pasted)
-                if df is not None:
-                    st.success(msg)
-                    st.dataframe(df, use_container_width=True)
-                else:
-                    st.error(msg)
-        with c2:
-            if pasted and st.button("🤖 معالجة AI", key=f"{prefix}_ai_paste"):
-                with st.spinner("جاري المعالجة..."):
-                    result = process_paste(pasted, prefix)
-                    if result["success"]:
-                        st.markdown(f'<div class="ai-box">{result["response"]}</div>', unsafe_allow_html=True)
-                    else:
-                        st.error(result["response"])
-
-
-def render_vs_table(df, prefix):
-    """عرض جدول المقارنة البصرية مع Pagination"""
-    ITEMS_PER_PAGE = 25
-    total = len(df)
-    total_pages = max(1, (total + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE)
-
+    # ── Pagination ─────────────────────────────
+    PAGE_SIZE = 25
+    total_pages = max(1, (len(filtered) + PAGE_SIZE - 1) // PAGE_SIZE)
     if total_pages > 1:
-        page_num = st.number_input(
-            f"الصفحة (من {total_pages})", 
-            min_value=1, max_value=total_pages, value=1,
-            key=f"page_{prefix}",
-            step=1
-        )
-        start = (page_num - 1) * ITEMS_PER_PAGE
-        end = min(start + ITEMS_PER_PAGE, total)
-        df_page = df.iloc[start:end]
-        st.caption(f"عرض {start+1}–{end} من {total} منتج | صفحة {page_num}/{total_pages}")
+        page_num = st.number_input("الصفحة", 1, total_pages, 1, key=f"{prefix}_pg")
     else:
-        df_page = df
+        page_num = 1
+    start = (page_num - 1) * PAGE_SIZE
+    page_df = filtered.iloc[start:start + PAGE_SIZE]
 
-    for idx, row in df_page.iterrows():
-        our_name = str(row.get("المنتج", ""))
-        comp_name = str(row.get("منتج المنافس", row.get("اسم المنافس", "")))
-        our_price = safe_float(row.get("السعر", 0))
-        comp_price = safe_float(row.get("سعر المنافس", row.get("أقل سعر منافس", 0)))
-        diff = safe_float(row.get("الفرق", our_price - comp_price))
-        match_pct = safe_float(row.get("نسبة التطابق", 0))
-        comp_source = str(row.get("المنافس", ""))
-        brand = str(row.get("الماركة", ""))
-        risk = str(row.get("الخطورة", ""))
+    # ── الجدول البصري ─────────────────────────
+    for idx, row in page_df.iterrows():
+        our_name   = str(row.get("المنتج", "—"))
+        comp_name  = str(row.get("منتج المنافس", "—"))
+        our_price  = safe_float(row.get("السعر", 0))
+        comp_price = safe_float(row.get("سعر المنافس", 0))
+        diff       = safe_float(row.get("الفرق", our_price - comp_price))
+        match_pct  = safe_float(row.get("نسبة التطابق", 0))
+        comp_src   = str(row.get("المنافس", ""))
+        brand      = str(row.get("الماركة", ""))
+        size       = row.get("الحجم", "")
+        ptype      = str(row.get("النوع", ""))
+        risk       = str(row.get("الخطورة", ""))
+        decision   = str(row.get("القرار", ""))
+        ts_now     = datetime.now().strftime("%Y-%m-%d %H:%M")
 
-        # بطاقة VS بصرية
-        st.markdown(vs_card(our_name, our_price, comp_name, comp_price, diff, comp_source), unsafe_allow_html=True)
+        # بطاقة VS
+        st.markdown(vs_card(our_name, our_price, comp_name,
+                            comp_price, diff, comp_src),
+                    unsafe_allow_html=True)
 
-        # شريط التطابق + معلومات إضافية
-        match_color = "#00C853" if match_pct >= 90 else "#FFD600" if match_pct >= 70 else "#FF1744"
-        risk_badge = f'<span class="badge b-high">{risk}</span>' if risk == "عالي" else f'<span class="badge b-med">{risk}</span>' if risk == "متوسط" else f'<span class="badge b-low">{risk}</span>'
+        # شريط المعلومات
+        match_color = ("#00C853" if match_pct >= 90
+                       else "#FFD600" if match_pct >= 70 else "#FF1744")
+        risk_html = ""
+        if risk:
+            rc = {"عالي": "#FF1744", "متوسط": "#FFD600", "منخفض": "#00C853"}.get(risk, "#888")
+            risk_html = f'<span style="color:{rc};font-size:.75rem;font-weight:700">⚡{risk}</span>'
 
-        st.markdown(f"""<div style="display:flex;justify-content:space-between;align-items:center;padding:2px 12px;font-size:.8rem;">
-        <span>🏷️ {brand}</span>
-        <span>تطابق: <span style="color:{match_color};font-weight:700">{match_pct:.0f}%</span></span>
-        {risk_badge if risk else ""}
+        # تاريخ آخر تغيير سعر
+        ph = get_price_history(our_name, comp_src, limit=2)
+        price_change_html = ""
+        if len(ph) >= 2:
+            old_p = ph[1]["price"]
+            chg = ph[0]["price"] - old_p
+            chg_c = "#FF1744" if chg > 0 else "#00C853"
+            price_change_html = f'<span style="color:{chg_c};font-size:.7rem">{"▲" if chg>0 else "▼"}{abs(chg):.0f} منذ {ph[1]["date"]}</span>'
+
+        # قرار معلق؟
+        pend = st.session_state.decisions_pending.get(our_name, {})
+        pend_html = decision_badge(pend.get("action", "")) if pend else ""
+
+        st.markdown(f"""
+        <div style="display:flex;justify-content:space-between;align-items:center;
+                    padding:3px 12px;font-size:.8rem;flex-wrap:wrap;gap:4px;">
+          <span>🏷️ <b>{brand}</b> {size} {ptype}</span>
+          <span>تطابق: <b style="color:{match_color}">{match_pct:.0f}%</b></span>
+          {risk_html}
+          {price_change_html}
+          {pend_html}
+          {ts_badge(ts_now)}
         </div>""", unsafe_allow_html=True)
 
-        # عرض المنافسين المتعددين
+        # منافسين متعددين
         all_comps = row.get("جميع المنافسين", [])
         if isinstance(all_comps, list) and len(all_comps) > 1:
-            with st.expander(f"👥 {len(all_comps)} منافسين", expanded=False):
+            with st.expander(f"👥 {len(all_comps)} منافس", expanded=False):
                 for cm in all_comps:
-                    st.markdown(f'<div class="multi-comp">🏪 <strong>{cm.get("competitor", "")}</strong>: {cm.get("name", "")} - <span style="color:#ff9800">{cm.get("price", 0):,.0f} ر.س</span> ({cm.get("score", 0):.0f}%)</div>', unsafe_allow_html=True)
+                    st.markdown(
+                        f'<div class="multi-comp">🏪 <b>{cm.get("competitor","")}</b>: '
+                        f'{cm.get("name","")} — '
+                        f'<span style="color:#ff9800">{cm.get("price",0):,.0f} ر.س</span> '
+                        f'({cm.get("score",0):.0f}%)</div>',
+                        unsafe_allow_html=True)
 
-        # أزرار لكل منتج
-        c1, c2, c3, c4, c5 = st.columns(5)
-        with c1:
-            if st.button("🤖 تحقق AI", key=f"ai_{prefix}_{idx}"):
-                with st.spinner("..."):
+        # ── أزرار لكل منتج ─────────────────────
+        b1, b2, b3, b4, b5, b6, b7 = st.columns(7)
+
+        with b1:  # AI تحقق
+            if st.button("🤖 تحقق", key=f"v_{prefix}_{idx}"):
+                with st.spinner("AI..."):
                     r = verify_match(our_name, comp_name, our_price, comp_price)
                     if r["success"]:
                         icon = "✅" if r.get("match") else "❌"
-                        st.info(f"{icon} ثقة: {r.get('confidence', 0)}% - {r.get('reason', '')}")
+                        st.info(f"{icon} {r.get('confidence',0)}% — {r.get('reason','')[:150]}")
                     else:
-                        st.error("فشل الاتصال بـ AI")
-        with c2:
-            if st.button("✅ موافقة", key=f"ok_{prefix}_{idx}"):
-                log_decision(our_name, prefix, "approved", "موافقة يدوية")
-                st.success("✅ تم")
-        with c3:
-            if st.button("📤 Make", key=f"mk_{prefix}_{idx}"):
-                r = send_single_product({"name": our_name, "price": our_price, "comp_name": comp_name, "comp_price": comp_price, "diff": diff})
-                st.success(r["message"]) if r["success"] else st.error(r["message"])
-        with c4:
-            if st.button("⏸️ تأجيل", key=f"dly_{prefix}_{idx}"):
-                log_decision(our_name, prefix, "deferred", "تأجيل")
-                st.warning("تم التأجيل")
-        with c5:
+                        st.error("فشل AI")
+
+        with b2:  # بحث سعر السوق
+            if st.button("🌐 سوق", key=f"mkt_{prefix}_{idx}"):
+                with st.spinner("يبحث..."):
+                    r = search_market_price(our_name, our_price)
+                    if r.get("success"):
+                        mp = r.get("market_price", 0)
+                        rng = r.get("price_range", {})
+                        rec = r.get("recommendation", "")
+                        st.info(f"💹 سعر السوق: **{mp:,.0f} ر.س** ({rng.get('min',0):.0f}–{rng.get('max',0):.0f})\n\n{rec}")
+                    else:
+                        st.warning("تعذر البحث")
+
+        with b3:  # موافق
+            if st.button("✅ موافق", key=f"ok_{prefix}_{idx}"):
+                st.session_state.decisions_pending[our_name] = {
+                    "action": "approved", "reason": "موافقة يدوية",
+                    "our_price": our_price, "comp_price": comp_price,
+                    "diff": diff, "competitor": comp_src,
+                    "ts": datetime.now().strftime("%Y-%m-%d %H:%M")
+                }
+                log_decision(our_name, prefix, "approved",
+                             "موافقة يدوية", our_price, comp_price, diff, comp_src)
+                st.success("✅")
+
+        with b4:  # تأجيل
+            if st.button("⏸️ تأجيل", key=f"df_{prefix}_{idx}"):
+                st.session_state.decisions_pending[our_name] = {
+                    "action": "deferred", "reason": "تأجيل",
+                    "our_price": our_price, "comp_price": comp_price,
+                    "diff": diff, "competitor": comp_src,
+                    "ts": datetime.now().strftime("%Y-%m-%d %H:%M")
+                }
+                log_decision(our_name, prefix, "deferred",
+                             "تأجيل", our_price, comp_price, diff, comp_src)
+                st.warning("⏸️")
+
+        with b5:  # إزالة
             if st.button("🗑️ إزالة", key=f"rm_{prefix}_{idx}"):
-                log_decision(our_name, prefix, "removed", "إزالة")
-                st.warning("تم الإزالة")
+                st.session_state.decisions_pending[our_name] = {
+                    "action": "removed", "reason": "إزالة",
+                    "our_price": our_price, "comp_price": comp_price,
+                    "diff": diff, "competitor": comp_src,
+                    "ts": datetime.now().strftime("%Y-%m-%d %H:%M")
+                }
+                log_decision(our_name, prefix, "removed",
+                             "إزالة", our_price, comp_price, diff, comp_src)
+                st.error("🗑️")
 
-        st.markdown("---")
+        with b6:  # تصدير Make
+            if st.button("📤 Make", key=f"mk_{prefix}_{idx}"):
+                res = send_single_product({
+                    "name": our_name, "price": our_price,
+                    "comp_name": comp_name, "comp_price": comp_price,
+                    "diff": diff, "decision": decision, "competitor": comp_src
+                })
+                st.success(res["message"]) if res["success"] else st.error(res["message"])
+
+        with b7:  # تاريخ السعر
+            if st.button("📈 تاريخ", key=f"ph_{prefix}_{idx}"):
+                history = get_price_history(our_name, comp_src)
+                if history:
+                    rows_h = [f"📅 {h['date']}: {h['price']:,.0f} ر.س" for h in history[:5]]
+                    st.info("\n".join(rows_h))
+                else:
+                    st.info("لا يوجد تاريخ بعد")
+
+        st.markdown('<hr style="border:none;border-top:1px solid #1a1a2e;margin:6px 0">', unsafe_allow_html=True)
 
 
-# ============================================================
-# ===== 1. لوحة التحكم =====
-# ============================================================
+# ════════════════════════════════════════════════
+#  الشريط الجانبي
+# ════════════════════════════════════════════════
+with st.sidebar:
+    st.markdown(f"## {APP_ICON} {APP_TITLE}")
+    st.caption(f"الإصدار {APP_VERSION}")
+
+    # حالة AI
+    ai_ok = bool(GEMINI_API_KEYS)
+    ai_color = "#00C853" if ai_ok else "#FF1744"
+    ai_label = f"🤖 Gemini ({len(GEMINI_API_KEYS)} مفتاح)" if ai_ok else "🔴 AI غير متصل"
+    st.markdown(f'<div style="background:{ai_color}22;border:1px solid {ai_color};'
+                f'border-radius:6px;padding:6px;text-align:center;color:{ai_color};'
+                f'font-weight:700;font-size:.85rem">{ai_label}</div>',
+                unsafe_allow_html=True)
+
+    # حالة المعالجة
+    if st.session_state.job_id:
+        job = get_job_progress(st.session_state.job_id)
+        if job and job["status"] == "running":
+            pct = job["processed"] / max(job["total"], 1)
+            st.progress(pct, f"⚙️ {job['processed']}/{job['total']} منتج")
+
+    page = st.radio("الأقسام", SECTIONS, label_visibility="collapsed")
+
+    st.markdown("---")
+    if st.session_state.results:
+        r = st.session_state.results
+        st.markdown("**📊 ملخص:**")
+        for key, icon, label in [
+            ("price_raise","🔴","أعلى"), ("price_lower","🟢","أقل"),
+            ("approved","✅","موافق"), ("missing","🔍","مفقود"),
+            ("review","⚠️","مراجعة")
+        ]:
+            cnt = len(r.get(key, pd.DataFrame()))
+            st.caption(f"{icon} {label}: **{cnt}**")
+
+    # قرارات معلقة
+    pending_cnt = len(st.session_state.decisions_pending)
+    if pending_cnt:
+        st.markdown(f'<div style="background:#FF174422;border:1px solid #FF1744;'
+                    f'border-radius:6px;padding:6px;text-align:center;color:#FF1744;'
+                    f'font-size:.8rem">📦 {pending_cnt} قرار معلق</div>',
+                    unsafe_allow_html=True)
+
+
+# ════════════════════════════════════════════════
+#  1. لوحة التحكم
+# ════════════════════════════════════════════════
 if page == "📊 لوحة التحكم":
     st.header("📊 لوحة التحكم")
     db_log("dashboard", "view")
+
+    # تغييرات الأسعار
+    changes = get_price_changes(7)
+    if changes:
+        st.markdown("#### 🔔 تغييرات أسعار آخر 7 أيام")
+        c_df = pd.DataFrame(changes)
+        st.dataframe(c_df[["product_name","competitor","old_price","new_price",
+                            "price_diff","new_date"]].rename(columns={
+            "product_name": "المنتج", "competitor": "المنافس",
+            "old_price": "السعر السابق", "new_price": "السعر الجديد",
+            "price_diff": "التغيير", "new_date": "التاريخ"
+        }), use_container_width=True, height=200)
+        st.markdown("---")
 
     if st.session_state.results:
         r = st.session_state.results
         cols = st.columns(5)
         data = [
-            ("🔴", "سعر أعلى", len(r.get("price_raise", pd.DataFrame())), COLORS["raise"]),
-            ("🟢", "سعر أقل", len(r.get("price_lower", pd.DataFrame())), COLORS["lower"]),
-            ("✅", "موافق", len(r.get("approved", pd.DataFrame())), COLORS["approved"]),
-            ("🔍", "مفقود", len(r.get("missing", pd.DataFrame())), COLORS["missing"]),
-            ("⚠️", "مراجعة", len(r.get("review", pd.DataFrame())), COLORS["review"]),
+            ("🔴","سعر أعلى",  len(r.get("price_raise", pd.DataFrame())), COLORS["raise"]),
+            ("🟢","سعر أقل",   len(r.get("price_lower", pd.DataFrame())), COLORS["lower"]),
+            ("✅","موافق",     len(r.get("approved", pd.DataFrame())),     COLORS["approved"]),
+            ("🔍","مفقود",     len(r.get("missing", pd.DataFrame())),      COLORS["missing"]),
+            ("⚠️","مراجعة",   len(r.get("review", pd.DataFrame())),       COLORS["review"]),
         ]
         for col, (icon, label, val, color) in zip(cols, data):
             col.markdown(stat_card(icon, label, val, color), unsafe_allow_html=True)
 
         st.markdown("---")
-
-        # تصدير شامل
-        c1, c2 = st.columns(2)
-        with c1:
-            if st.button("📥 تصدير كل الأقسام Excel"):
-                sheets = {}
-                for key, name in [("price_raise", "سعر_أعلى"), ("price_lower", "سعر_أقل"),
-                                  ("approved", "موافق"), ("missing", "مفقود"), ("review", "مراجعة")]:
+        cc1, cc2 = st.columns(2)
+        with cc1:
+            sheets = {}
+            for key, name in [("price_raise","سعر_أعلى"),("price_lower","سعر_أقل"),
+                               ("approved","موافق"),("missing","مفقود"),("review","مراجعة")]:
+                if key in r and not r[key].empty:
+                    df_ex = r[key].copy()
+                    if "جميع المنافسين" in df_ex.columns:
+                        df_ex = df_ex.drop(columns=["جميع المنافسين"])
+                    sheets[name] = df_ex
+            if sheets:
+                excel_all = export_multiple_sheets(sheets)
+                st.download_button("📥 تصدير كل الأقسام Excel",
+                    data=excel_all, file_name="mahwous_all.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        with cc2:
+            if st.button("📤 إرسال كل شيء لـ Make"):
+                for key in ["price_raise","price_lower"]:
                     if key in r and not r[key].empty:
-                        df = r[key].copy()
-                        if "جميع المنافسين" in df.columns:
-                            df = df.drop(columns=["جميع المنافسين"])
-                        sheets[name] = df
-                if sheets:
-                    excel = export_multiple_sheets(sheets)
-                    st.download_button("⬇️ تحميل الملف الشامل", excel, "all_sections.xlsx")
-        with c2:
-            if st.button("📤 تصدير كل شيء لـ Make"):
-                for key in ["price_raise", "price_lower"]:
-                    if key in r and not r[key].empty:
-                        products = export_to_make_format(r[key], "update")
-                        send_price_updates(products)
-                st.success("تم الإرسال!")
+                        send_price_updates(export_to_make_format(r[key], "update"))
+                st.success("✅ تم!")
     else:
-        st.info("👈 ارفع ملفات منتجاتك وملفات المنافسين من قسم 'رفع الملفات' للبدء")
+        # استئناف آخر job؟
+        last = get_last_job()
+        if last and last["status"] == "done" and last.get("results"):
+            st.info(f"💾 يوجد تحليل محفوظ من {last.get('updated_at','')}")
+            if st.button("🔄 استعادة النتائج المحفوظة"):
+                df_all = pd.DataFrame(last["results"])
+                if not df_all.empty:
+                    st.session_state.results = {
+                        "price_raise": df_all[df_all["القرار"].str.contains("أعلى",na=False)].reset_index(drop=True),
+                        "price_lower": df_all[df_all["القرار"].str.contains("أقل", na=False)].reset_index(drop=True),
+                        "approved":    df_all[df_all["القرار"].str.contains("موافق",na=False)].reset_index(drop=True),
+                        "review":      df_all[df_all["القرار"].str.contains("مراجعة",na=False)].reset_index(drop=True),
+                        "missing": pd.DataFrame(), "all": df_all,
+                    }
+                    st.session_state.analysis_df = df_all
+                    st.rerun()
+        else:
+            st.info("👈 ارفع ملفاتك من قسم 'رفع الملفات'")
 
 
-# ============================================================
-# ===== 2. رفع الملفات =====
-# ============================================================
+# ════════════════════════════════════════════════
+#  2. رفع الملفات
+# ════════════════════════════════════════════════
 elif page == "📂 رفع الملفات":
-    st.header("📂 رفع الملفات وتحليلها")
+    st.header("📂 رفع الملفات")
     db_log("upload", "view")
 
-    st.markdown("**ارفع ملف منتجاتك وملفات المنافسين (CSV أو Excel)**")
+    our_file   = st.file_uploader("📦 ملف منتجاتنا (CSV/Excel)",
+                                   type=["csv","xlsx","xls"], key="our_file")
+    comp_files = st.file_uploader("🏪 ملفات المنافسين (متعدد)",
+                                   type=["csv","xlsx","xls"],
+                                   accept_multiple_files=True, key="comp_files")
 
-    our_file = st.file_uploader("📦 ملف منتجاتنا", type=["csv", "xlsx", "xls"], key="our_file")
-    comp_files = st.file_uploader("🏪 ملفات المنافسين", type=["csv", "xlsx", "xls"],
-                                  accept_multiple_files=True, key="comp_files")
-
-    col_opts1, col_opts2 = st.columns(2)
-    with col_opts1:
-        bg_mode = st.checkbox("⚡ معالجة في الخلفية (أسرع للملفات الكبيرة)", value=False,
-                              help="يعالج الملفات دون تجميد الواجهة")
-    with col_opts2:
-        max_rows = st.number_input("أقصى عدد صفوف (0=كل)", min_value=0, value=0, step=100)
+    col_opt1, col_opt2 = st.columns(2)
+    with col_opt1:
+        bg_mode  = st.checkbox("⚡ معالجة خلفية (يمكنك التنقل أثناء التحليل)", value=True)
+    with col_opt2:
+        max_rows = st.number_input("حد الصفوف للمعالجة (0=كل)", 0, step=500)
 
     if st.button("🚀 بدء التحليل", type="primary"):
         if our_file and comp_files:
             our_df, err = read_file(our_file)
             if err:
-                st.error(f"❌ خطأ في ملف منتجاتنا: {err}")
+                st.error(f"❌ {err}")
             else:
+                if max_rows > 0:
+                    our_df = our_df.head(int(max_rows))
+
                 comp_dfs = {}
                 for cf in comp_files:
                     cdf, cerr = read_file(cf)
-                    if cerr:
-                        st.warning(f"⚠️ خطأ في {cf.name}: {cerr}")
-                    else:
-                        comp_dfs[cf.name] = cdf
+                    if cerr: st.warning(f"⚠️ {cf.name}: {cerr}")
+                    else: comp_dfs[cf.name] = cdf
 
                 if comp_dfs:
-                    try:
-                        progress = st.progress(0, "جاري التحليل...")
-                        def update_progress(pct):
-                            progress.progress(pct, f"جاري التحليل... {pct*100:.0f}%")
+                    job_id = str(uuid.uuid4())[:8]
+                    st.session_state.job_id = job_id
+                    comp_names = ",".join(comp_dfs.keys())
 
-                        analysis_df = run_full_analysis(our_df, comp_dfs, progress_callback=update_progress)
+                    if bg_mode:
+                        # ── خلفية ──
+                        t = threading.Thread(
+                            target=_run_analysis_background,
+                            args=(job_id, our_df, comp_dfs,
+                                  our_file.name, comp_names),
+                            daemon=True
+                        )
+                        t.start()
+                        st.session_state.job_running = True
+                        st.success(f"✅ بدأ التحليل في الخلفية (Job: {job_id})")
+                        st.info("🔄 تابع التقدم من لوحة التحكم أو انتظر هنا")
+
+                        # polling
+                        progress_bar = st.progress(0, "جاري التحليل...")
+                        for _ in range(300):  # max 5 دقائق
+                            time.sleep(2)
+                            job = get_job_progress(job_id)
+                            if job:
+                                pct = job["processed"] / max(job["total"], 1)
+                                progress_bar.progress(
+                                    min(pct, 0.99),
+                                    f"⚙️ {job['processed']}/{job['total']} منتج"
+                                )
+                                if job["status"] == "done":
+                                    break
+                                elif job["status"].startswith("error"):
+                                    st.error(f"❌ {job['status']}")
+                                    break
+
+                        job = get_job_progress(job_id)
+                        if job and job["status"] == "done" and job.get("results"):
+                            df_all = pd.DataFrame(job["results"])
+                            missing_df = find_missing_products(our_df, comp_dfs)
+                            st.session_state.results = {
+                                "price_raise": df_all[df_all["القرار"].str.contains("أعلى",na=False)].reset_index(drop=True),
+                                "price_lower": df_all[df_all["القرار"].str.contains("أقل", na=False)].reset_index(drop=True),
+                                "approved":    df_all[df_all["القرار"].str.contains("موافق",na=False)].reset_index(drop=True),
+                                "review":      df_all[df_all["القرار"].str.contains("مراجعة",na=False)].reset_index(drop=True),
+                                "missing": missing_df, "all": df_all,
+                            }
+                            st.session_state.analysis_df = df_all
+                            progress_bar.progress(1.0, "✅ اكتمل!")
+                            st.balloons()
+                    else:
+                        # ── مباشر ──
+                        prog = st.progress(0, "جاري التحليل...")
+                        def upd(p): prog.progress(p, f"{p*100:.0f}%")
+                        df_all = run_full_analysis(our_df, comp_dfs, progress_callback=upd)
                         missing_df = find_missing_products(our_df, comp_dfs)
 
-                        # تصنيف النتائج
-                        results = {
-                            "price_raise": analysis_df[analysis_df["القرار"].str.contains("أعلى", na=False)].reset_index(drop=True),
-                            "price_lower": analysis_df[analysis_df["القرار"].str.contains("أقل", na=False)].reset_index(drop=True),
-                            "approved": analysis_df[analysis_df["القرار"].str.contains("موافق", na=False)].reset_index(drop=True),
-                            "review": analysis_df[analysis_df["القرار"].str.contains("مراجعة", na=False)].reset_index(drop=True),
-                            "missing": missing_df,
-                            "all": analysis_df,
+                        for _, row in df_all.iterrows():
+                            if row.get("نسبة التطابق", 0) > 0:
+                                upsert_price_history(
+                                    str(row.get("المنتج","")), str(row.get("المنافس","")),
+                                    safe_float(row.get("سعر المنافس",0)),
+                                    safe_float(row.get("السعر",0)),
+                                    safe_float(row.get("الفرق",0)),
+                                    safe_float(row.get("نسبة التطابق",0)),
+                                    str(row.get("القرار",""))
+                                )
+
+                        st.session_state.results = {
+                            "price_raise": df_all[df_all["القرار"].str.contains("أعلى",na=False)].reset_index(drop=True),
+                            "price_lower": df_all[df_all["القرار"].str.contains("أقل", na=False)].reset_index(drop=True),
+                            "approved":    df_all[df_all["القرار"].str.contains("موافق",na=False)].reset_index(drop=True),
+                            "review":      df_all[df_all["القرار"].str.contains("مراجعة",na=False)].reset_index(drop=True),
+                            "missing": missing_df, "all": df_all,
                         }
-
-                        st.session_state.results = results
-                        st.session_state.analysis_df = analysis_df
-                        st.session_state.missing_df = missing_df
-
-                        total_our = len(our_df)
-                        matched = len(analysis_df[analysis_df["نسبة التطابق"] > 0])
-                        missing_count = len(missing_df)
-
-                        log_analysis(our_file.name, ",".join([f.name for f in comp_files]),
-                                     total_our, matched, missing_count)
-
-                        progress.progress(1.0, "✅ اكتمل التحليل!")
-                        st.success(f"✅ تم! {matched} متطابق | {missing_count} مفقود | {len(results['review'])} مراجعة")
+                        st.session_state.analysis_df = df_all
+                        log_analysis(our_file.name, comp_names, len(our_df),
+                                     len(df_all[df_all["نسبة التطابق"]>0]), len(missing_df))
+                        prog.progress(1.0, "✅ اكتمل!")
                         st.balloons()
-                    except Exception as e:
-                        st.error(f"❌ خطأ: {str(e)}")
-                else:
-                    st.error("❌ لم يتم قراءة أي ملف منافس بنجاح")
         else:
             st.warning("⚠️ ارفع ملف منتجاتنا وملف منافس واحد على الأقل")
 
 
-# ============================================================
-# ===== 3. سعر أعلى =====
-# ============================================================
+# ════════════════════════════════════════════════
+#  3. سعر أعلى
+# ════════════════════════════════════════════════
 elif page == "🔴 سعر أعلى":
-    st.header("🔴 منتجات سعرنا أعلى من المنافسين")
+    st.header("🔴 منتجات سعرنا أعلى — فرصة خفض")
     db_log("price_raise", "view")
-
     if st.session_state.results and "price_raise" in st.session_state.results:
         df = st.session_state.results["price_raise"]
         if not df.empty:
-            st.error(f"⚠️ {len(df)} منتج سعرنا أعلى - يحتاج مراجعة فورية")
-            filters = render_filters(df, "raise")
-            filtered = apply_filters(df, filters)
-            render_action_bar(filtered, "raise", "update")
-            render_paste_section("raise")
-            st.markdown(f"**عرض {len(filtered)} من {len(df)} منتج**")
-            render_vs_table(filtered, "raise")
+            st.error(f"⚠️ {len(df)} منتج سعرنا أعلى من المنافسين")
+            # AI تدريب لهذا القسم
+            with st.expander("🤖 نصيحة AI لهذا القسم", expanded=False):
+                if st.button("📡 احصل على تحليل شامل للقسم", key="ai_section_raise"):
+                    with st.spinner("🤖 AI يحلل..."):
+                        r = call_ai(f"عندي {len(df)} منتج سعرنا أعلى من المنافسين. أعطني استراتيجية خفض الأسعار.", "price_raise")
+                        st.markdown(f'<div class="ai-box">{r["response"]}</div>', unsafe_allow_html=True)
+            render_pro_table(df, "raise", "update")
         else:
-            st.success("✅ لا توجد منتجات بسعر أعلى")
-    else:
-        st.info("ارفع الملفات أولاً من قسم 'رفع الملفات'")
-
-
-# ============================================================
-# ===== 4. سعر أقل =====
-# ============================================================
-elif page == "🟢 سعر أقل":
-    st.header("🟢 منتجات سعرنا أقل من المنافسين")
-    db_log("price_lower", "view")
-
-    if st.session_state.results and "price_lower" in st.session_state.results:
-        df = st.session_state.results["price_lower"]
-        if not df.empty:
-            st.info(f"💰 {len(df)} منتج سعرنا أقل - فرصة لرفع السعر")
-            filters = render_filters(df, "lower")
-            filtered = apply_filters(df, filters)
-            render_action_bar(filtered, "lower", "update")
-            render_paste_section("lower")
-            st.markdown(f"**عرض {len(filtered)} من {len(df)} منتج**")
-            render_vs_table(filtered, "lower")
-        else:
-            st.info("لا توجد منتجات بسعر أقل")
+            st.success("✅ ممتاز! لا توجد منتجات بسعر أعلى")
     else:
         st.info("ارفع الملفات أولاً")
 
 
-# ============================================================
-# ===== 5. موافق عليها =====
-# ============================================================
-elif page == "✅ موافق عليها":
-    st.header("✅ المنتجات الموافق عليها")
-    db_log("approved", "view")
+# ════════════════════════════════════════════════
+#  4. سعر أقل
+# ════════════════════════════════════════════════
+elif page == "🟢 سعر أقل":
+    st.header("🟢 منتجات سعرنا أقل — فرصة رفع")
+    db_log("price_lower", "view")
+    if st.session_state.results and "price_lower" in st.session_state.results:
+        df = st.session_state.results["price_lower"]
+        if not df.empty:
+            st.info(f"💰 {len(df)} منتج يمكن رفع سعره لزيادة الهامش")
+            with st.expander("🤖 نصيحة AI لهذا القسم", expanded=False):
+                if st.button("📡 استراتيجية رفع الأسعار", key="ai_section_lower"):
+                    with st.spinner("🤖"):
+                        r = call_ai(f"عندي {len(df)} منتج سعرنا أقل من المنافسين. كيف أرفع الأسعار بأمان؟", "price_lower")
+                        st.markdown(f'<div class="ai-box">{r["response"]}</div>', unsafe_allow_html=True)
+            render_pro_table(df, "lower", "update")
+        else:
+            st.info("لا توجد منتجات")
+    else:
+        st.info("ارفع الملفات أولاً")
 
+
+# ════════════════════════════════════════════════
+#  5. موافق عليها
+# ════════════════════════════════════════════════
+elif page == "✅ موافق عليها":
+    st.header("✅ منتجات موافق عليها")
+    db_log("approved", "view")
     if st.session_state.results and "approved" in st.session_state.results:
         df = st.session_state.results["approved"]
         if not df.empty:
-            st.success(f"✅ {len(df)} منتج موافق عليه - الأسعار مناسبة")
-            filters = render_filters(df, "approved")
-            filtered = apply_filters(df, filters)
-            render_action_bar(filtered, "approved", "update")
-            render_paste_section("approved")
-            st.markdown(f"**عرض {len(filtered)} من {len(df)} منتج**")
-            render_vs_table(filtered, "approved")
+            st.success(f"✅ {len(df)} منتج بأسعار تنافسية مناسبة")
+            render_pro_table(df, "approved", "update")
         else:
             st.info("لا توجد منتجات موافق عليها")
     else:
         st.info("ارفع الملفات أولاً")
 
 
-# ============================================================
-# ===== 6. منتجات مفقودة =====
-# ============================================================
+# ════════════════════════════════════════════════
+#  6. منتجات مفقودة
+# ════════════════════════════════════════════════
 elif page == "🔍 منتجات مفقودة":
     st.header("🔍 منتجات المنافسين غير الموجودة عندنا")
     db_log("missing", "view")
@@ -419,227 +674,229 @@ elif page == "🔍 منتجات مفقودة":
     if st.session_state.results and "missing" in st.session_state.results:
         df = st.session_state.results["missing"]
         if not df.empty:
-            st.warning(f"⚠️ {len(df)} منتج مفقود - تحقق بدقة قبل الإضافة لتجنب التكرار!")
+            st.warning(f"⚠️ {len(df)} منتج مفقود")
+
+            # AI للقسم
+            with st.expander("🤖 نصيحة AI — أولويات الإضافة", expanded=False):
+                if st.button("📡 تحليل المنتجات المفقودة", key="ai_missing_section"):
+                    with st.spinner("🤖"):
+                        r = call_ai(f"عندي {len(df)} منتج عند المنافسين غير موجود في متجرنا مهووس. أعطني توصيات أولويات الإضافة.", "missing")
+                        st.markdown(f'<div class="ai-box">{r["response"]}</div>', unsafe_allow_html=True)
 
             # فلاتر
             opts = get_filter_options(df)
             with st.expander("🔍 فلاتر", expanded=False):
                 c1, c2, c3 = st.columns(3)
-                search = c1.text_input("🔎 بحث", key="miss_search")
-                brand_f = c2.selectbox("الماركة", opts["brands"], key="miss_brand")
-                comp_f = c3.selectbox("المنافس", opts["competitors"], key="miss_comp")
+                search  = c1.text_input("🔎 بحث", key="miss_s")
+                brand_f = c2.selectbox("الماركة", opts["brands"], key="miss_b")
+                comp_f  = c3.selectbox("المنافس", opts["competitors"], key="miss_c")
 
             filtered = df.copy()
             if search:
-                filtered = filtered[filtered.apply(lambda r: search.lower() in str(r.values).lower(), axis=1)]
+                filtered = filtered[filtered.apply(
+                    lambda r: search.lower() in str(r.values).lower(), axis=1)]
             if brand_f != "الكل" and "الماركة" in filtered.columns:
                 filtered = filtered[filtered["الماركة"].str.contains(brand_f, case=False, na=False)]
             if comp_f != "الكل" and "المنافس" in filtered.columns:
                 filtered = filtered[filtered["المنافس"].str.contains(comp_f, case=False, na=False)]
 
-            # أزرار عامة
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                if st.button("📥 تصدير Excel", key="miss_excel"):
-                    excel = export_to_excel(filtered, "مفقودة")
-                    st.download_button("⬇️ تحميل", excel, "missing.xlsx", key="miss_dl")
-            with c2:
-                if st.button("🤖 تحقق AI جماعي", key="miss_bulk_ai"):
-                    with st.spinner("جاري التحقق من التكرار بالذكاء الصناعي..."):
-                        items = [{"our": "", "comp": str(r.get("منتج المنافس", "")),
-                                  "our_price": 0, "comp_price": safe_float(r.get("سعر المنافس", 0))}
-                                 for _, r in filtered.head(20).iterrows()]
-                        result = bulk_verify(items, "missing")
-                        if result["success"]:
-                            st.markdown(f'<div class="ai-box">{result["response"]}</div>', unsafe_allow_html=True)
-                        else:
-                            st.error(result["response"])
-            with c3:
-                if st.button("📤 تصدير Make", key="miss_make"):
-                    products = [{"name": str(r.get("منتج المنافس", "")),
-                                 "price": safe_float(r.get("سعر المنافس", 0)),
-                                 "brand": str(r.get("الماركة", "")),
-                                 "competitor": str(r.get("المنافس", ""))}
+            # تصدير
+            cc1, cc2 = st.columns(2)
+            with cc1:
+                excel_m = export_to_excel(filtered, "مفقودة")
+                st.download_button("📥 Excel", data=excel_m, file_name="missing.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="miss_dl")
+            with cc2:
+                if st.button("📤 إرسال كل لـ Make", key="miss_make_all"):
+                    products = [{"name": str(r.get("منتج المنافس","")),
+                                 "price": safe_float(r.get("سعر المنافس",0)),
+                                 "brand": str(r.get("الماركة","")),
+                                 "competitor": str(r.get("المنافس",""))}
                                 for _, r in filtered.iterrows()]
-                    result = send_missing_products(products)
-                    st.success(result["message"]) if result["success"] else st.error(result["message"])
+                    res = send_missing_products(products)
+                    st.success(res["message"]) if res["success"] else st.error(res["message"])
 
-            render_paste_section("missing")
+            st.caption(f"{len(filtered)} منتج — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
 
-            st.markdown(f"**عرض {len(filtered)} من {len(df)} منتج مفقود**")
+            # عرض كل منتج
+            PAGE_SIZE = 20
+            total_p = len(filtered)
+            tp = max(1, (total_p + PAGE_SIZE - 1) // PAGE_SIZE)
+            pn = st.number_input("الصفحة", 1, tp, 1, key="miss_pg") if tp > 1 else 1
+            page_df = filtered.iloc[(pn-1)*PAGE_SIZE:pn*PAGE_SIZE]
 
-            # عرض المنتجات المفقودة
-            for idx, row in filtered.iterrows():
-                name = str(row.get("منتج المنافس", ""))
-                price = safe_float(row.get("سعر المنافس", 0))
-                brand = str(row.get("الماركة", ""))
-                comp = str(row.get("المنافس", ""))
-                size = row.get("الحجم", "")
-                ptype = row.get("النوع", "")
+            for idx, row in page_df.iterrows():
+                name   = str(row.get("منتج المنافس", ""))
+                price  = safe_float(row.get("سعر المنافس", 0))
+                brand  = str(row.get("الماركة", ""))
+                comp   = str(row.get("المنافس", ""))
+                size   = row.get("الحجم", "")
+                ptype  = str(row.get("النوع", ""))
 
-                st.markdown(f"""<div style="border:1px solid #007bff;border-radius:8px;padding:12px;margin:5px 0;background:#0a1628;">
-                <div style="display:flex;justify-content:space-between;align-items:center;">
-                    <div><strong style="color:#4fc3f7;font-size:1rem;">{name}</strong></div>
-                    <div><span style="color:#ff9800;font-weight:700;font-size:1.1rem;">{price:,.0f} ر.س</span></div>
-                </div>
-                <div style="font-size:.8rem;color:#888;margin-top:4px;">🏷️ {brand} | 📏 {size} | 🏪 {comp} | 🧴 {ptype}</div>
+                st.markdown(f"""
+                <div style="border:1px solid #007bff44;border-radius:8px;padding:12px;
+                            margin:4px 0;background:linear-gradient(90deg,#0a1628,#0e1a30);">
+                  <div style="display:flex;justify-content:space-between;align-items:center">
+                    <div style="flex:1">
+                      <div style="font-weight:700;color:#4fc3f7;font-size:.95rem">{name}</div>
+                      <div style="font-size:.75rem;color:#888;margin-top:3px">
+                        🏷️ {brand} | 📏 {size} | 🧴 {ptype} | 🏪 {comp}
+                      </div>
+                    </div>
+                    <div style="font-size:1.2rem;font-weight:900;color:#ff9800;margin-left:12px">
+                      {price:,.0f} ر.س
+                    </div>
+                  </div>
                 </div>""", unsafe_allow_html=True)
 
-                c1, c2, c3, c4 = st.columns(4)
-                with c1:
-                    if st.button("🤖 تحقق تكرار", key=f"dup_{idx}"):
+                b1, b2, b3, b4, b5 = st.columns(5)
+
+                with b1:  # تحقق تكرار AI
+                    if st.button("🤖 تكرار؟", key=f"dup_{idx}"):
                         with st.spinner("..."):
-                            our_products = []
+                            our_prods = []
                             if st.session_state.analysis_df is not None:
-                                our_products = st.session_state.analysis_df.get("المنتج", pd.Series()).tolist()
-                            r = check_duplicate(name, our_products[:50])
-                            if r["success"]:
-                                st.markdown(f'<div class="ai-box">{r["response"]}</div>', unsafe_allow_html=True)
+                                our_prods = st.session_state.analysis_df.get(
+                                    "المنتج", pd.Series()).tolist()
+                            r = check_duplicate(name, our_prods[:50])
+                            st.info(r["response"][:200] if r["success"] else "فشل")
+
+                with b2:  # بحث في مهووس
+                    if st.button("🔎 مهووس", key=f"mhw_{idx}"):
+                        with st.spinner("يبحث في mahwous.com..."):
+                            r = search_mahwous(name)
+                            if r.get("success"):
+                                avail = "✅ متوفر" if r.get("likely_available") else "❌ غير متوفر"
+                                pri = r.get("add_recommendation", "")
+                                reason = r.get("reason", "")[:150]
+                                st.info(f"{avail} | أولوية الإضافة: **{pri}**\n\n{reason}")
                             else:
-                                st.error("فشل الاتصال بـ AI")
-                with c2:
-                    if st.button("✅ إضافة", key=f"add_{idx}"):
-                        log_decision(name, "missing", "to_add", "إضافة للمتجر")
-                        st.success("تم وضع علامة للإضافة")
-                with c3:
-                    if st.button("📤 Make", key=f"mk_miss_{idx}"):
-                        r = send_single_product({"name": name, "price": price, "brand": brand}, "new")
-                        st.success(r["message"]) if r["success"] else st.error(r["message"])
-                with c4:
+                                st.warning("تعذر البحث")
+
+                with b3:  # بحث سعر السوق
+                    if st.button("💹 سوق", key=f"mkt_m_{idx}"):
+                        with st.spinner("..."):
+                            r = search_market_price(name, price)
+                            if r.get("success"):
+                                mp = r.get("market_price", 0)
+                                rec = r.get("recommendation", "")[:150]
+                                st.info(f"💹 سعر السوق: {mp:,.0f} ر.س\n\n{rec}")
+
+                with b4:  # إضافة للـ Make
+                    if st.button("📤 Make", key=f"mk_m_{idx}"):
+                        res = send_single_product(
+                            {"name": name, "price": price, "brand": brand, "competitor": comp},
+                            "new"
+                        )
+                        st.success(res["message"]) if res["success"] else st.error(res["message"])
+
+                with b5:  # تجاهل
                     if st.button("🗑️ تجاهل", key=f"ign_{idx}"):
-                        log_decision(name, "missing", "ignored", "تجاهل")
-                        st.warning("تم التجاهل")
-                st.markdown("---")
+                        log_decision(name, "missing", "ignored", "تجاهل", 0, price, -price, comp)
+                        st.warning("تم")
+
+                st.markdown('<hr style="border:none;border-top:1px solid #111;margin:4px 0">',
+                            unsafe_allow_html=True)
         else:
-            st.success("✅ لا توجد منتجات مفقودة")
+            st.success("✅ لا توجد منتجات مفقودة!")
     else:
         st.info("ارفع الملفات أولاً")
 
 
-# ============================================================
-# ===== 7. تحت المراجعة =====
-# ============================================================
+# ════════════════════════════════════════════════
+#  7. تحت المراجعة
+# ════════════════════════════════════════════════
 elif page == "⚠️ تحت المراجعة":
-    st.header("⚠️ منتجات تحتاج مراجعة")
+    st.header("⚠️ منتجات تحت المراجعة")
     db_log("review", "view")
-
     if st.session_state.results and "review" in st.session_state.results:
         df = st.session_state.results["review"]
         if not df.empty:
-            st.warning(f"⚠️ {len(df)} منتج يحتاج مراجعة - تطابق غير مؤكد")
-            filters = render_filters(df, "review")
-            filtered = apply_filters(df, filters)
-            render_action_bar(filtered, "review", "update")
-            render_paste_section("review")
-
-            st.markdown(f"**عرض {len(filtered)} من {len(df)} منتج**")
-
-            # عرض المنتجات مع أزرار قرار خاصة بالمراجعة
-            for idx, row in filtered.iterrows():
-                our_name = str(row.get("المنتج", ""))
-                comp_name = str(row.get("منتج المنافس", ""))
-                our_price = safe_float(row.get("السعر", 0))
-                comp_price = safe_float(row.get("سعر المنافس", 0))
-                diff = safe_float(row.get("الفرق", 0))
-                match_pct = safe_float(row.get("نسبة التطابق", 0))
-                comp_source = str(row.get("المنافس", ""))
-
-                # بطاقة VS بصرية
-                st.markdown(vs_card(our_name, our_price, comp_name, comp_price, diff, comp_source), unsafe_allow_html=True)
-
-                match_color = "#FFD600" if match_pct >= 70 else "#FF1744"
-                st.markdown(f'<div style="text-align:center;font-size:.85rem;">تطابق: <span style="color:{match_color};font-weight:700">{match_pct:.0f}%</span></div>', unsafe_allow_html=True)
-
-                # أزرار قرار المراجعة
-                c1, c2, c3, c4, c5 = st.columns(5)
-                with c1:
-                    if st.button("🤖 تحقق AI", key=f"ai_rev_{idx}"):
-                        with st.spinner("..."):
-                            r = verify_match(our_name, comp_name, our_price, comp_price)
-                            if r["success"]:
-                                icon = "✅" if r.get("match") else "❌"
-                                st.info(f"{icon} ثقة: {r.get('confidence', 0)}% - {r.get('reason', '')}")
-                            else:
-                                st.error("فشل الاتصال بـ AI")
-                with c2:
-                    if st.button("✅ نقل لموافق", key=f"app_rev_{idx}"):
-                        log_decision(our_name, "review", "approved")
-                        st.success("تم النقل")
-                with c3:
-                    if st.button("📉 نقل لمخفض", key=f"low_rev_{idx}"):
-                        log_decision(our_name, "review", "price_lower")
-                        st.success("تم النقل")
-                with c4:
-                    if st.button("📤 Make", key=f"mk_rev_{idx}"):
-                        r = send_single_product({"name": our_name, "price": our_price, "comp_name": comp_name, "comp_price": comp_price})
-                        st.success(r["message"]) if r["success"] else st.error(r["message"])
-                with c5:
-                    if st.button("🗑️ إزالة", key=f"rm_rev_{idx}"):
-                        log_decision(our_name, "review", "removed")
-                        st.warning("تم الإزالة")
-                st.markdown("---")
+            st.warning(f"⚠️ {len(df)} منتج بتطابق غير مؤكد")
+            with st.expander("🤖 نصيحة AI — كيف تتعامل مع المراجعة", expanded=False):
+                if st.button("📡 تحليل قسم المراجعة", key="ai_review_section"):
+                    with st.spinner("🤖"):
+                        r = call_ai(f"عندي {len(df)} منتج بتطابق غير مؤكد. أعطني أفضل طريقة للتحقق.", "review")
+                        st.markdown(f'<div class="ai-box">{r["response"]}</div>', unsafe_allow_html=True)
+            render_pro_table(df, "review", "update")
         else:
-            st.success("✅ لا توجد منتجات تحتاج مراجعة")
+            st.success("✅ لا توجد منتجات تحت المراجعة")
     else:
         st.info("ارفع الملفات أولاً")
 
 
-# ============================================================
-# ===== 8. المقارنة البصرية =====
-# ============================================================
-elif page == "📊 مقارنة بصرية":
-    st.header("📊 المقارنة البصرية الشاملة")
-    db_log("visual", "view")
-
-    if st.session_state.results:
-        r = st.session_state.results
-        tab1, tab2, tab3 = st.tabs(["📊 ملخص الأسعار", "📈 توزيع التطابق", "🏷️ حسب الماركة"])
-
-        with tab1:
-            data = {"القسم": ["أعلى سعراً", "أقل سعراً", "موافق", "مفقودة", "مراجعة"],
-                    "العدد": [len(r.get("price_raise", pd.DataFrame())), len(r.get("price_lower", pd.DataFrame())),
-                              len(r.get("approved", pd.DataFrame())), len(r.get("missing", pd.DataFrame())),
-                              len(r.get("review", pd.DataFrame()))]}
-            st.bar_chart(pd.DataFrame(data).set_index("القسم"))
-
-        with tab2:
-            all_matched = pd.DataFrame()
-            for key in ["price_raise", "price_lower", "approved", "review"]:
-                if key in r and not r[key].empty:
-                    all_matched = pd.concat([all_matched, r[key]])
-            if not all_matched.empty and "نسبة التطابق" in all_matched.columns:
-                st.bar_chart(all_matched["نسبة التطابق"].value_counts().sort_index())
-
-        with tab3:
-            if not all_matched.empty and "الماركة" in all_matched.columns:
-                brand_counts = all_matched["الماركة"].value_counts().head(15)
-                st.bar_chart(brand_counts)
-    else:
-        st.info("ارفع الملفات أولاً")
-
-
-# ============================================================
-# ===== 9. الذكاء الصناعي =====
-# ============================================================
+# ════════════════════════════════════════════════
+#  8. الذكاء الاصطناعي — Gemini مباشر
+# ════════════════════════════════════════════════
 elif page == "🤖 الذكاء الصناعي":
-    st.header("🤖 مساعد الذكاء الصناعي")
+    st.header("🤖 Gemini AI — خبير التسعير")
     db_log("ai", "view")
 
-    tab1, tab2, tab3 = st.tabs(["💬 دردشة", "🔍 تحقق منتج", "📊 تحليل"])
+    if not GEMINI_API_KEYS:
+        st.error("❌ لم يتم إعداد مفتاح Gemini. أضفه في Streamlit Secrets: GEMINI_KEY_1")
+    else:
+        # حالة الاتصال
+        st.markdown(f"""
+        <div style="background:#00C85322;border:1px solid #00C853;border-radius:8px;
+                    padding:8px 16px;margin-bottom:12px;display:flex;align-items:center;gap:8px">
+          <span style="font-size:1.2rem">🟢</span>
+          <span style="color:#00C853;font-weight:700">Gemini Flash متصل ({len(GEMINI_API_KEYS)} مفتاح)</span>
+          <span style="color:#555;font-size:.8rem">| نموذج: {GEMINI_MODEL}</span>
+        </div>""", unsafe_allow_html=True)
+
+    tab1, tab2, tab3, tab4 = st.tabs(["💬 دردشة Gemini", "🔍 تحقق منتج", "💹 بحث سوق", "📊 تحليل مجمع"])
 
     with tab1:
-        st.markdown("**اسأل أي سؤال عن التسعير والمنافسة:**")
-        for h in st.session_state.chat_history[-10:]:
-            st.markdown(f"**أنت:** {h['user']}")
-            st.markdown(f"**AI ({h.get('source', '')}):** {h['ai']}")
-            st.markdown("---")
+        st.markdown("**اسأل خبير التسعير — مدرّب على سوق العطور السعودي:**")
 
-        user_msg = st.text_input("💬 اكتب رسالتك:", key="chat_input")
-        if user_msg and st.button("إرسال", key="chat_send"):
-            with st.spinner("🤖 جاري الرد..."):
-                result = chat_with_ai(user_msg, st.session_state.chat_history)
+        # سياق تلقائي
+        ctx = ""
+        if st.session_state.results:
+            r = st.session_state.results
+            ctx = (f"(البيانات المحملة: {len(r.get('all',pd.DataFrame()))} منتج، "
+                   f"{len(r.get('price_raise',pd.DataFrame()))} سعر أعلى، "
+                   f"{len(r.get('price_lower',pd.DataFrame()))} سعر أقل)")
+            st.caption(f"📊 {ctx}")
+
+        # عرض المحادثة
+        chat_container = st.container()
+        with chat_container:
+            for h in st.session_state.chat_history[-10:]:
+                st.markdown(
+                    f'<div style="text-align:right;margin:4px 0">'
+                    f'<span style="background:#1a1a2e;padding:6px 12px;border-radius:8px;'
+                    f'color:#B8B4FF;font-size:.9rem">👤 {h["user"]}</span>'
+                    f'{ts_badge(h.get("ts",""))}</div>',
+                    unsafe_allow_html=True)
+                st.markdown(
+                    f'<div class="ai-box" style="margin:4px 0">'
+                    f'<span style="color:#555;font-size:.7rem">{h.get("source","Gemini")}</span><br>'
+                    f'{h["ai"]}</div>',
+                    unsafe_allow_html=True)
+
+        # إدخال
+        user_msg = st.text_input("💬 رسالتك:", key="chat_in",
+                                  placeholder="مثال: ما أفضل استراتيجية لخفض الأسعار؟")
+
+        cc1, cc2 = st.columns([3,1])
+        with cc1:
+            send = st.button("📨 إرسال", type="primary", key="chat_send")
+        with cc2:
+            if st.button("🗑️ مسح المحادثة", key="clear_chat"):
+                st.session_state.chat_history = []
+                st.rerun()
+
+        if send and user_msg:
+            prompt = f"{ctx}\n\n{user_msg}" if ctx else user_msg
+            with st.spinner("🤖 Gemini يفكر..."):
+                result = gemini_chat(prompt, st.session_state.chat_history)
                 if result["success"]:
-                    st.session_state.chat_history.append({"user": user_msg, "ai": result["response"], "source": result["source"]})
+                    st.session_state.chat_history.append({
+                        "user": user_msg, "ai": result["response"],
+                        "source": result["source"],
+                        "ts": datetime.now().strftime("%H:%M")
+                    })
                     st.rerun()
                 else:
                     st.error(result["response"])
@@ -650,42 +907,70 @@ elif page == "🤖 الذكاء الصناعي":
         p1 = c1.text_input("منتجنا:", key="v_our")
         p2 = c2.text_input("المنافس:", key="v_comp")
         c3, c4 = st.columns(2)
-        pr1 = c3.number_input("سعرنا:", 0.0, key="v_pr1")
-        pr2 = c4.number_input("سعر المنافس:", 0.0, key="v_pr2")
+        pr1 = c3.number_input("سعرنا:", 0.0, key="v_p1")
+        pr2 = c4.number_input("سعر المنافس:", 0.0, key="v_p2")
 
-        if st.button("🔍 تحقق", key="verify_btn"):
+        if st.button("🔍 تحقق الآن", key="vbtn"):
             if p1 and p2:
                 with st.spinner("..."):
                     r = verify_match(p1, p2, pr1, pr2)
                     if r["success"]:
                         col = "🟢" if r.get("match") else "🔴"
-                        st.markdown(f"{col} **التطابق:** {'نعم' if r.get('match') else 'لا'}")
-                        st.markdown(f"**الثقة:** {r.get('confidence', 0)}%")
-                        st.markdown(f"**السبب:** {r.get('reason', '')}")
+                        st.markdown(f"{col} **{'متطابق' if r.get('match') else 'غير متطابق'}** — "
+                                    f"ثقة: **{r.get('confidence',0)}%**")
+                        st.info(r.get("reason", ""))
                     else:
-                        st.error("فشل الاتصال بـ AI")
+                        st.error("فشل الاتصال")
 
     with tab3:
-        product = st.text_input("اسم المنتج:", key="analyze_name")
-        price = st.number_input("السعر:", 0.0, key="analyze_price")
-        if st.button("📊 تحليل", key="analyze_btn"):
-            if product:
-                with st.spinner("..."):
-                    r = analyze_product(product, price)
-                    if r["success"]:
-                        st.markdown(f'<div class="ai-box">{r["response"]}</div>', unsafe_allow_html=True)
-                    else:
-                        st.error(r["response"])
+        st.markdown("**بحث في السوق عن سعر منتج:**")
+        prod_search = st.text_input("اسم المنتج:", key="mkt_prod")
+        cur_price   = st.number_input("سعرنا الحالي:", 0.0, key="mkt_price")
+        if st.button("🌐 ابحث في السوق", key="mkt_btn"):
+            if prod_search:
+                with st.spinner("🌐 يبحث..."):
+                    r = search_market_price(prod_search, cur_price)
+                    if r.get("success"):
+                        mp = r.get("market_price", 0)
+                        rng = r.get("price_range", {})
+                        comps = r.get("competitors", [])
+                        rec = r.get("recommendation", "")
+                        st.metric("سعر السوق المقترح", f"{mp:,.0f} ر.س",
+                                  delta=f"{mp-cur_price:+.0f} ر.س")
+                        if comps:
+                            st.markdown("**منافسون في السوق:**")
+                            for c in comps[:5]:
+                                st.markdown(f"🏪 {c.get('name','')}: {c.get('price',0):,.0f} ر.س")
+                        if rec:
+                            st.info(f"💡 {rec}")
+
+    with tab4:
+        st.markdown("**تحليل مجمع بالذكاء الاصطناعي:**")
+        if st.session_state.results:
+            sec = st.selectbox("القسم:", ["price_raise","price_lower","approved","review"], key="bulk_sec")
+            if st.button("🤖 تحليل", key="bulk_btn"):
+                df_sec = st.session_state.results.get(sec, pd.DataFrame())
+                if not df_sec.empty:
+                    with st.spinner("🤖"):
+                        items = [{
+                            "our": str(r.get("المنتج","")),
+                            "comp": str(r.get("منتج المنافس","")),
+                            "our_price": safe_float(r.get("السعر",0)),
+                            "comp_price": safe_float(r.get("سعر المنافس",0))
+                        } for _, r in df_sec.head(20).iterrows()]
+                        res = bulk_verify(items, sec)
+                        st.markdown(f'<div class="ai-box">{res["response"]}</div>',
+                                    unsafe_allow_html=True)
 
 
-# ============================================================
-# ===== 10. أتمتة Make =====
-# ============================================================
+# ════════════════════════════════════════════════
+#  9. أتمتة Make
+# ════════════════════════════════════════════════
 elif page == "⚡ أتمتة Make":
     st.header("⚡ أتمتة Make.com")
     db_log("make", "view")
 
-    tab1, tab2, tab3 = st.tabs(["🔗 حالة الاتصال", "📤 إرسال يدوي", "📜 السجل"])
+    tab1, tab2, tab3 = st.tabs(["🔗 حالة الاتصال", "📤 إرسال", "📦 القرارات المعلقة"])
 
     with tab1:
         if st.button("🔍 فحص الاتصال"):
@@ -693,40 +978,57 @@ elif page == "⚡ أتمتة Make":
                 results = verify_webhook_connection()
                 for name, r in results.items():
                     if name != "all_connected":
-                        st.markdown(f"**{name}:** {r['message']}")
-                if results["all_connected"]:
+                        color = "🟢" if r["success"] else "🔴"
+                        st.markdown(f"{color} **{name}:** {r['message']}")
+                if results.get("all_connected"):
                     st.success("✅ جميع الاتصالات تعمل")
-                else:
-                    st.error("❌ بعض الاتصالات لا تعمل")
 
     with tab2:
-        st.markdown("**إرسال بيانات يدوياً:**")
-        wh_type = st.selectbox("نوع الإرسال", ["تحديث أسعار", "منتجات جديدة", "منتجات مفقودة"])
-
         if st.session_state.results:
-            section_map = {"تحديث أسعار": "price_raise", "منتجات جديدة": "price_lower", "منتجات مفقودة": "missing"}
-            key = section_map.get(wh_type, "price_raise")
-            if key in st.session_state.results and not st.session_state.results[key].empty:
-                df = st.session_state.results[key]
-                st.info(f"سيتم إرسال {len(df)} منتج")
+            wh = st.selectbox("نوع الإرسال", ["تحديث أسعار","منتجات جديدة","مفقودة"])
+            key_map = {"تحديث أسعار":"price_raise","منتجات جديدة":"price_lower","مفقودة":"missing"}
+            sec_key = key_map[wh]
+            df_s = st.session_state.results.get(sec_key, pd.DataFrame())
+            if not df_s.empty:
+                st.info(f"سيتم إرسال {len(df_s)} منتج")
                 if st.button("📤 إرسال الآن"):
-                    products = export_to_make_format(df, key)
-                    func = {"تحديث أسعار": send_price_updates, "منتجات جديدة": send_new_products, "منتجات مفقودة": send_missing_products}
-                    result = func.get(wh_type, send_price_updates)(products)
-                    st.success(result["message"]) if result["success"] else st.error(result["message"])
+                    products = export_to_make_format(df_s, sec_key)
+                    func = {"تحديث أسعار": send_price_updates,
+                            "منتجات جديدة": send_new_products,
+                            "مفقودة": send_missing_products}
+                    res = func[wh](products)
+                    st.success(res["message"]) if res["success"] else st.error(res["message"])
 
     with tab3:
-        events = get_events("make", 20)
-        if events:
-            for e in events:
-                st.text(f"[{e['timestamp']}] {e['event_type']}: {e['details']}")
+        pending = st.session_state.decisions_pending
+        if pending:
+            st.info(f"📦 {len(pending)} قرار معلق")
+            df_p = pd.DataFrame([
+                {"المنتج": k, "القرار": v["action"],
+                 "وقت القرار": v.get("ts",""), "المنافس": v.get("competitor","")}
+                for k, v in pending.items()
+            ])
+            st.dataframe(df_p, use_container_width=True)
+
+            c1, c2 = st.columns(2)
+            with c1:
+                if st.button("📤 إرسال كل القرارات لـ Make"):
+                    to_send = [{"name": k, **v} for k, v in pending.items()]
+                    res = send_price_updates(to_send)
+                    st.success(res["message"])
+                    st.session_state.decisions_pending = {}
+                    st.rerun()
+            with c2:
+                if st.button("🗑️ مسح القرارات"):
+                    st.session_state.decisions_pending = {}
+                    st.rerun()
         else:
-            st.info("لا يوجد سجل بعد")
+            st.info("لا توجد قرارات معلقة")
 
 
-# ============================================================
-# ===== 11. الإعدادات =====
-# ============================================================
+# ════════════════════════════════════════════════
+#  10. الإعدادات
+# ════════════════════════════════════════════════
 elif page == "⚙️ الإعدادات":
     st.header("⚙️ الإعدادات")
     db_log("settings", "view")
@@ -734,60 +1036,81 @@ elif page == "⚙️ الإعدادات":
     tab1, tab2, tab3 = st.tabs(["🔑 المفاتيح", "⚙️ المطابقة", "📜 السجل"])
 
     with tab1:
-        st.markdown("**مفاتيح API (محمية):**")
-        gemini_status = f"✅ {len(GEMINI_API_KEYS)} مفاتيح مفعلة" if GEMINI_API_KEYS else "❌ غير مفعل"
-        openrouter_status = "✅ مفعل" if OPENROUTER_API_KEY else "❌ غير مفعل"
-        st.info(f"Gemini: {gemini_status}")
-        st.info(f"OpenRouter: {openrouter_status}")
-
-        st.markdown("**Webhooks:**")
-        st.info(f"تحديث أسعار: {'✅ مربوط' if WEBHOOK_UPDATE_PRICES else '❌'}")
-        st.info(f"منتجات جديدة: {'✅ مربوط' if WEBHOOK_NEW_PRODUCTS else '❌'}")
-
-        if st.button("🔍 اختبار AI"):
-            with st.spinner("جاري الاختبار..."):
-                r = call_ai("مرحباً، اختبار اتصال. أجب بكلمة واحدة: يعمل")
+        gemini_s = f"✅ {len(GEMINI_API_KEYS)} مفتاح" if GEMINI_API_KEYS else "❌"
+        or_s = "✅ مفعل" if OPENROUTER_API_KEY else "❌"
+        st.info(f"Gemini API: {gemini_s}")
+        st.info(f"OpenRouter: {or_s}")
+        st.info(f"Webhook أسعار: {'✅' if WEBHOOK_UPDATE_PRICES else '❌'}")
+        st.info(f"Webhook منتجات: {'✅' if WEBHOOK_NEW_PRODUCTS else '❌'}")
+        if st.button("🧪 اختبار AI"):
+            with st.spinner("..."):
+                r = call_ai("مرحباً، اختبار سريع. أجب: يعمل")
                 if r["success"]:
-                    st.success(f"✅ AI يعمل ({r['source']}): {r['response'][:100]}")
+                    st.success(f"✅ AI يعمل ({r['source']}): {r['response'][:80]}")
                 else:
-                    st.error(f"❌ {r['response']}")
+                    st.error(r["response"])
 
     with tab2:
-        st.markdown("**إعدادات المطابقة:**")
         st.info(f"حد التطابق الأدنى: {MIN_MATCH_SCORE}%")
         st.info(f"حد التطابق العالي: {HIGH_MATCH_SCORE}%")
-        st.info(f"حد فرق السعر: {PRICE_DIFF_THRESHOLD} ر.س")
+        st.info(f"هامش فرق السعر: {PRICE_DIFF_THRESHOLD} ر.س")
 
     with tab3:
         decisions = get_decisions(limit=30)
         if decisions:
-            for d in decisions:
-                st.text(f"[{d['timestamp']}] {d['product_name']}: {d['old_status']} → {d['new_status']} ({d.get('reason', '')})")
+            df_dec = pd.DataFrame(decisions)
+            st.dataframe(df_dec[["timestamp","product_name","old_status",
+                                  "new_status","reason","competitor"]].rename(columns={
+                "timestamp":"التاريخ","product_name":"المنتج",
+                "old_status":"من","new_status":"إلى",
+                "reason":"السبب","competitor":"المنافس"
+            }), use_container_width=True)
         else:
             st.info("لا توجد قرارات مسجلة")
 
 
-# ============================================================
-# ===== 12. السجل =====
-# ============================================================
+# ════════════════════════════════════════════════
+#  11. السجل
+# ════════════════════════════════════════════════
 elif page == "📜 السجل":
-    st.header("📜 سجل التحليلات والأحداث")
+    st.header("📜 السجل الكامل")
     db_log("log", "view")
 
-    tab1, tab2 = st.tabs(["📊 تحليلات سابقة", "📝 كل الأحداث"])
+    tab1, tab2, tab3 = st.tabs(["📊 التحليلات", "💰 تغييرات الأسعار", "📝 الأحداث"])
 
     with tab1:
         history = get_analysis_history(20)
         if history:
-            for h in history:
-                st.markdown(f"**[{h['timestamp']}]** {h['our_file']} vs {h['comp_file']} → {h['matched']} متطابق | {h['missing']} مفقود")
+            df_h = pd.DataFrame(history)
+            st.dataframe(df_h[["timestamp","our_file","comp_file",
+                                "total_products","matched","missing"]].rename(columns={
+                "timestamp":"التاريخ","our_file":"ملف منتجاتنا",
+                "comp_file":"ملف المنافس","total_products":"الإجمالي",
+                "matched":"متطابق","missing":"مفقود"
+            }), use_container_width=True)
         else:
             st.info("لا يوجد تاريخ")
 
     with tab2:
+        days = st.slider("آخر X يوم", 1, 30, 7)
+        changes = get_price_changes(days)
+        if changes:
+            df_c = pd.DataFrame(changes)
+            st.dataframe(df_c.rename(columns={
+                "product_name":"المنتج","competitor":"المنافس",
+                "old_price":"السعر السابق","new_price":"السعر الجديد",
+                "price_diff":"التغيير","new_date":"تاريخ التغيير"
+            }), use_container_width=True)
+        else:
+            st.info(f"لا توجد تغييرات في آخر {days} يوم")
+
+    with tab3:
         events = get_events(limit=50)
         if events:
-            df_events = pd.DataFrame(events)
-            st.dataframe(df_events, use_container_width=True)
+            df_e = pd.DataFrame(events)
+            st.dataframe(df_e[["timestamp","page","event_type","details"]].rename(columns={
+                "timestamp":"التاريخ","page":"الصفحة",
+                "event_type":"الحدث","details":"التفاصيل"
+            }), use_container_width=True)
         else:
             st.info("لا توجد أحداث")
