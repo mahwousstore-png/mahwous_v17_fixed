@@ -1,5 +1,5 @@
 """
-app.py - نظام التسعير الذكي مهووس v18.0
+app.py - نظام التسعير الذكي مهووس v19.0
 ✅ معالجة خلفية مع حفظ تلقائي
 ✅ جداول مقارنة بصرية في كل الأقسام
 ✅ أزرار AI + قرارات لكل منتج
@@ -26,7 +26,9 @@ from engines.ai_engine import (call_ai, gemini_chat, chat_with_ai,
                                 verify_match, analyze_product,
                                 bulk_verify, suggest_price,
                                 search_market_price, search_mahwous,
-                                check_duplicate, process_paste)
+                                check_duplicate, process_paste,
+                                fetch_fragrantica_info, generate_mahwous_description,
+                                analyze_paste)
 from utils.helpers import (apply_filters, get_filter_options, export_to_excel,
                             export_multiple_sheets, parse_pasted_text,
                             safe_float, format_price, format_diff)
@@ -169,14 +171,25 @@ def render_pro_table(df, prefix, section_type="update", show_search=True):
     filtered = apply_filters(df, filters)
 
     # ── شريط الأدوات ───────────────────────────
-    ac1, ac2, ac3, ac4 = st.columns(4)
+    ac1, ac2, ac3, ac4, ac5 = st.columns(5)
     with ac1:
-        excel_data = export_to_excel(filtered, prefix)
+        _exdf = filtered.copy()
+        if "جميع المنافسين" in _exdf.columns: _exdf = _exdf.drop(columns=["جميع المنافسين"])
+        if "جميع_المنافسين" in _exdf.columns: _exdf = _exdf.drop(columns=["جميع_المنافسين"])
+        excel_data = export_to_excel(_exdf, prefix)
         st.download_button("📥 Excel", data=excel_data,
             file_name=f"{prefix}_{datetime.now().strftime('%Y%m%d')}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             key=f"{prefix}_xl")
     with ac2:
+        _csdf = filtered.copy()
+        if "جميع المنافسين" in _csdf.columns: _csdf = _csdf.drop(columns=["جميع المنافسين"])
+        if "جميع_المنافسين" in _csdf.columns: _csdf = _csdf.drop(columns=["جميع_المنافسين"])
+        _csv_bytes = _csdf.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+        st.download_button("📄 CSV", data=_csv_bytes,
+            file_name=f"{prefix}_{datetime.now().strftime('%Y%m%d')}.csv",
+            mime="text/csv", key=f"{prefix}_csv")
+    with ac3:
         if st.button("🤖 AI جماعي (أول 20)", key=f"{prefix}_bulk"):
             with st.spinner("🤖 AI يحلل..."):
                 items = [{
@@ -188,12 +201,12 @@ def render_pro_table(df, prefix, section_type="update", show_search=True):
                 res = bulk_verify(items, prefix)
                 st.markdown(f'<div class="ai-box">{res["response"]}</div>',
                             unsafe_allow_html=True)
-    with ac3:
+    with ac4:
         if st.button("📤 إرسال كل لـ Make", key=f"{prefix}_make_all"):
             products = export_to_make_format(filtered, section_type)
             res = send_price_updates(products) if section_type == "update" else send_new_products(products)
             st.success(res["message"]) if res["success"] else st.error(res["message"])
-    with ac4:
+    with ac5:
         # جمع القرارات المعلقة وإرسالها
         pending = {k: v for k, v in st.session_state.decisions_pending.items()
                    if v["action"] in ["approved", "deferred", "removed"]}
@@ -282,7 +295,7 @@ def render_pro_table(df, prefix, section_type="update", show_search=True):
                         unsafe_allow_html=True)
 
         # ── أزرار لكل منتج ─────────────────────
-        b1, b2, b3, b4, b5, b6, b7 = st.columns(7)
+        b1, b2, b3, b4, b5, b6, b7, b8 = st.columns(8)
 
         with b1:  # AI تحقق
             if st.button("🤖 تحقق", key=f"v_{prefix}_{idx}"):
@@ -351,7 +364,15 @@ def render_pro_table(df, prefix, section_type="update", show_search=True):
                 })
                 st.success(res["message"]) if res["success"] else st.error(res["message"])
 
-        with b7:  # تاريخ السعر
+        with b7:  # تحقق AI
+            if st.button("🔍 تحقق", key=f"vrf_{prefix}_{idx}"):
+                with st.spinner("🤖"):
+                    _vr2 = verify_match(our_name, comp_name, our_price, comp_price)
+                    if _vr2.get("success"):
+                        _mc2 = "🟢 متطابق" if _vr2.get("match") else "🔴 غير متطابق"
+                        st.markdown(f"{_mc2} — ثقة: **{_vr2.get('confidence',0)}%**")
+
+        with b8:  # تاريخ السعر
             if st.button("📈 تاريخ", key=f"ph_{prefix}_{idx}"):
                 history = get_price_history(our_name, comp_src)
                 if history:
@@ -729,13 +750,18 @@ elif page == "🔍 منتجات مفقودة":
                 filtered = filtered[filtered["المنافس"].str.contains(comp_f, case=False, na=False)]
 
             # تصدير
-            cc1, cc2 = st.columns(2)
+            cc1, cc2, cc3 = st.columns(3)
             with cc1:
                 excel_m = export_to_excel(filtered, "مفقودة")
                 st.download_button("📥 Excel", data=excel_m, file_name="missing.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     key="miss_dl")
             with cc2:
+                _cmdf = filtered.copy()
+                _csv_m = _cmdf.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+                st.download_button("📄 CSV", data=_csv_m, file_name="missing.csv",
+                    mime="text/csv", key="miss_csv")
+            with cc3:
                 if st.button("📤 إرسال كل لـ Make", key="miss_make_all"):
                     products = [{"name": str(r.get("منتج المنافس","")),
                                  "price": safe_float(r.get("سعر المنافس",0)),
@@ -778,9 +804,36 @@ elif page == "🔍 منتجات مفقودة":
                   </div>
                 </div>""", unsafe_allow_html=True)
 
-                b1, b2, b3, b4, b5 = st.columns(5)
+                b1, b2, b3, b4, b5, b6, b7, b8 = st.columns(8)
 
-                with b1:  # تحقق تكرار AI
+                with b1:  # صورة + مكونات
+                    if st.button("🖼️ صورة", key=f"img_{idx}"):
+                        with st.spinner("يجلب من Fragrantica Arabia..."):
+                            fi = fetch_fragrantica_info(name)
+                            if fi.get("success"):
+                                img = fi.get("image_url","")
+                                if img and img.startswith("http"):
+                                    st.image(img, width=180, caption=name)
+                                top = ", ".join(fi.get("top_notes",[]))
+                                mid = ", ".join(fi.get("middle_notes",[]))
+                                base = ", ".join(fi.get("base_notes",[]))
+                                if top or mid or base:
+                                    st.markdown(f"🌸 **قمة:** {top}  \n💐 **قلب:** {mid}  \n🌿 **قاعدة:** {base}")
+                                if fi.get("description_ar"):
+                                    st.info(fi["description_ar"][:200])
+                                if fi.get("fragrantica_url"):
+                                    st.markdown(f"[🔗 Fragrantica Arabia]({fi['fragrantica_url']})")
+                            else:
+                                st.warning("لم يتم العثور على صورة")
+
+                with b2:  # وصف مهووس
+                    if st.button("✍️ وصف مهووس", key=f"mhdesc_{idx}"):
+                        with st.spinner("يولّد الوصف..."):
+                            fi2 = fetch_fragrantica_info(name)
+                            desc = generate_mahwous_description(name, price, fi2)
+                            st.text_area("وصف المنتج — نسخ للمتجر:", desc, height=250, key=f"mhd_ta_{idx}")
+
+                with b3:  # تحقق تكرار AI
                     if st.button("🤖 تكرار؟", key=f"dup_{idx}"):
                         with st.spinner("..."):
                             our_prods = []
@@ -790,7 +843,7 @@ elif page == "🔍 منتجات مفقودة":
                             r = check_duplicate(name, our_prods[:50])
                             st.info(r["response"][:200] if r["success"] else "فشل")
 
-                with b2:  # بحث في مهووس
+                with b4:  # بحث في مهووس
                     if st.button("🔎 مهووس", key=f"mhw_{idx}"):
                         with st.spinner("يبحث في mahwous.com..."):
                             r = search_mahwous(name)
@@ -798,20 +851,28 @@ elif page == "🔍 منتجات مفقودة":
                                 avail = "✅ متوفر" if r.get("likely_available") else "❌ غير متوفر"
                                 pri = r.get("add_recommendation", "")
                                 reason = r.get("reason", "")[:150]
-                                st.info(f"{avail} | أولوية الإضافة: **{pri}**\n\n{reason}")
+                                sp = r.get("suggested_price", 0)
+                                st.info(f"{avail} | أولوية: **{pri}** | سعر مقترح: {sp:,.0f}ر.س\n\n{reason}")
                             else:
                                 st.warning("تعذر البحث")
 
-                with b3:  # بحث سعر السوق
+                with b5:  # بحث سعر السوق
                     if st.button("💹 سوق", key=f"mkt_m_{idx}"):
-                        with st.spinner("..."):
+                        with st.spinner("🌐 يبحث في السوق..."):
                             r = search_market_price(name, price)
                             if r.get("success"):
                                 mp = r.get("market_price", 0)
-                                rec = r.get("recommendation", "")[:150]
-                                st.info(f"💹 سعر السوق: {mp:,.0f} ر.س\n\n{rec}")
+                                rng = r.get("price_range", {})
+                                rec = r.get("recommendation", "")[:200]
+                                mn = rng.get("min",0); mx = rng.get("max",0)
+                                st.markdown(f"""
+<div style="background:#0e1a2e;border:1px solid #007bff44;border-radius:8px;padding:10px;">
+  <div style="font-weight:700;color:#4fc3f7">💹 سعر السوق: {mp:,.0f} ر.س</div>
+  <div style="color:#888;font-size:.8rem">النطاق: {mn:,.0f} - {mx:,.0f} ر.س</div>
+  <div style="color:#aaa;font-size:.82rem;margin-top:6px">{rec}</div>
+</div>""", unsafe_allow_html=True)
 
-                with b4:  # إضافة للـ Make
+                with b6:  # إضافة للـ Make
                     if st.button("📤 Make", key=f"mk_m_{idx}"):
                         res = send_single_product(
                             {"name": name, "price": price, "brand": brand, "competitor": comp},
@@ -858,137 +919,314 @@ elif page == "⚠️ تحت المراجعة":
 #  8. الذكاء الاصطناعي — Gemini مباشر
 # ════════════════════════════════════════════════
 elif page == "🤖 الذكاء الصناعي":
-    st.header("🤖 Gemini AI — خبير التسعير")
     db_log("ai", "view")
 
-    if not GEMINI_API_KEYS:
-        st.error("❌ لم يتم إعداد مفتاح Gemini. أضفه في Streamlit Secrets: GEMINI_KEY_1")
+    # ── شريط الحالة ──
+    if GEMINI_API_KEYS:
+        st.markdown(f'''<div style="background:linear-gradient(90deg,#051505,#030d1f);
+            border:1px solid #00C853;border-radius:10px;padding:10px 18px;
+            margin-bottom:12px;display:flex;align-items:center;gap:10px;">
+          <div style="width:10px;height:10px;border-radius:50%;background:#00C853;
+                      box-shadow:0 0 8px #00C853;animation:pulse 2s infinite"></div>
+          <span style="color:#00C853;font-weight:800;font-size:1rem">Gemini Flash — متصل مباشرة</span>
+          <span style="color:#555;font-size:.78rem"> | {len(GEMINI_API_KEYS)} مفاتيح | {GEMINI_MODEL}</span>
+        </div>''', unsafe_allow_html=True)
     else:
-        # حالة الاتصال
-        st.markdown(f"""
-        <div style="background:#00C85322;border:1px solid #00C853;border-radius:8px;
-                    padding:8px 16px;margin-bottom:12px;display:flex;align-items:center;gap:8px">
-          <span style="font-size:1.2rem">🟢</span>
-          <span style="color:#00C853;font-weight:700">Gemini Flash متصل ({len(GEMINI_API_KEYS)} مفتاح)</span>
-          <span style="color:#555;font-size:.8rem">| نموذج: {GEMINI_MODEL}</span>
-        </div>""", unsafe_allow_html=True)
+        st.error("❌ Gemini غير متصل — أضف GEMINI_API_KEYS في Streamlit Secrets")
 
-    tab1, tab2, tab3, tab4 = st.tabs(["💬 دردشة Gemini", "🔍 تحقق منتج", "💹 بحث سوق", "📊 تحليل مجمع"])
+    # ── سياق البيانات ──
+    _ctx = []
+    if st.session_state.results:
+        _r = st.session_state.results
+        _ctx = [
+            f"المنتجات الكلية: {len(_r.get('all', pd.DataFrame()))}",
+            f"سعر أعلى: {len(_r.get('price_raise', pd.DataFrame()))}",
+            f"سعر أقل: {len(_r.get('price_lower', pd.DataFrame()))}",
+            f"موافق: {len(_r.get('approved', pd.DataFrame()))}",
+            f"مراجعة: {len(_r.get('review', pd.DataFrame()))}",
+            f"مفقود: {len(_r.get('missing', pd.DataFrame()))}",
+        ]
+    _ctx_str = " | ".join(_ctx) if _ctx else "لم يتم تحليل بيانات بعد"
 
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "💬 دردشة مباشرة", "📋 لصق وتحليل", "🔍 تحقق منتج", "💹 بحث سوق", "📊 أوامر مجمعة"
+    ])
+
+    # ═══ TAB 1: دردشة Gemini مباشرة ═══════════
     with tab1:
-        st.markdown("**اسأل خبير التسعير — مدرّب على سوق العطور السعودي:**")
+        st.caption(f"📊 البيانات: {_ctx_str}")
 
-        # سياق تلقائي
-        ctx = ""
-        if st.session_state.results:
-            r = st.session_state.results
-            ctx = (f"(البيانات المحملة: {len(r.get('all',pd.DataFrame()))} منتج، "
-                   f"{len(r.get('price_raise',pd.DataFrame()))} سعر أعلى، "
-                   f"{len(r.get('price_lower',pd.DataFrame()))} سعر أقل)")
-            st.caption(f"📊 {ctx}")
+        # صندوق المحادثة
+        _chat_h = 430
+        _msgs_html = ""
+        if not st.session_state.chat_history:
+            _msgs_html = """<div style="text-align:center;padding:60px 20px;color:#333">
+              <div style="font-size:3rem">🤖</div>
+              <div style="color:#666;margin-top:10px;font-size:1rem">Gemini Flash جاهز للمساعدة</div>
+              <div style="color:#444;margin-top:6px;font-size:.82rem">
+                اسأل عن الأسعار · المنتجات · توصيات التسعير · تحليل المنافسين
+              </div>
+            </div>"""
+        else:
+            for h in st.session_state.chat_history[-15:]:
+                _msgs_html += f"""
+                <div style="display:flex;justify-content:flex-end;margin:5px 0">
+                  <div style="background:#1e1e3f;color:#B8B4FF;padding:8px 14px;
+                              border-radius:14px 14px 2px 14px;max-width:82%;font-size:.88rem;
+                              line-height:1.5">{h['user']}</div>
+                </div>
+                <div style="display:flex;justify-content:flex-start;margin:4px 0 10px 0">
+                  <div style="background:#080f1e;border:1px solid #1a3050;color:#d0d0d0;
+                              padding:10px 14px;border-radius:14px 14px 14px 2px;
+                              max-width:88%;font-size:.88rem;line-height:1.65">
+                    <span style="color:#00C853;font-size:.65rem;font-weight:700">
+                      ● {h.get('source','Gemini')} · {h.get('ts','')}</span><br>
+                    {h['ai'].replace(chr(10),'<br>')}
+                  </div>
+                </div>"""
 
-        # عرض المحادثة
-        chat_container = st.container()
-        with chat_container:
-            for h in st.session_state.chat_history[-10:]:
-                st.markdown(
-                    f'<div style="text-align:right;margin:4px 0">'
-                    f'<span style="background:#1a1a2e;padding:6px 12px;border-radius:8px;'
-                    f'color:#B8B4FF;font-size:.9rem">👤 {h["user"]}</span>'
-                    f'{ts_badge(h.get("ts",""))}</div>',
-                    unsafe_allow_html=True)
-                st.markdown(
-                    f'<div class="ai-box" style="margin:4px 0">'
-                    f'<span style="color:#555;font-size:.7rem">{h.get("source","Gemini")}</span><br>'
-                    f'{h["ai"]}</div>',
-                    unsafe_allow_html=True)
+        st.markdown(
+            f'''<div style="background:#050b14;border:1px solid #1a3050;border-radius:12px;
+                padding:14px;height:{_chat_h}px;overflow-y:auto;direction:rtl">
+              {_msgs_html}
+            </div>''', unsafe_allow_html=True)
 
         # إدخال
-        user_msg = st.text_input("💬 رسالتك:", key="chat_in",
-                                  placeholder="مثال: ما أفضل استراتيجية لخفض الأسعار؟")
+        _mc1, _mc2 = st.columns([5, 1])
+        with _mc1:
+            _user_in = st.text_input("", key="gem_in",
+                placeholder="اسأل Gemini — عن المنتجات، الأسعار، التوصيات...",
+                label_visibility="collapsed")
+        with _mc2:
+            _send = st.button("➤ إرسال", key="gem_send", type="primary", use_container_width=True)
 
-        cc1, cc2 = st.columns([3,1])
-        with cc1:
-            send = st.button("📨 إرسال", type="primary", key="chat_send")
-        with cc2:
-            if st.button("🗑️ مسح المحادثة", key="clear_chat"):
-                st.session_state.chat_history = []
-                st.rerun()
+        # أزرار سريعة
+        _qc = st.columns(4)
+        _quick = None
+        _quick_labels = [
+            ("📉 أولويات الخفض", "بناءً على البيانات المحملة أعطني أولويات خفض الأسعار مع الأرقام"),
+            ("📈 فرص الرفع", "حلّل فرص رفع الأسعار وأعطني توصية مرتبة"),
+            ("🔍 أولويات المفقودات", "حلّل المنتجات المفقودة وأعطني أولويات الإضافة"),
+            ("📊 ملخص شامل", f"أعطني ملخصاً تنفيذياً: {_ctx_str}"),
+        ]
+        for i, (lbl, q) in enumerate(_quick_labels):
+            with _qc[i]:
+                if st.button(lbl, key=f"q{i}", use_container_width=True):
+                    _quick = q
 
-        if send and user_msg:
-            prompt = f"{ctx}\n\n{user_msg}" if ctx else user_msg
+        _msg_to_send = _quick or (_user_in if _send and _user_in else None)
+        if _msg_to_send:
+            _full = f"سياق البيانات: {_ctx_str}\n\n{_msg_to_send}"
             with st.spinner("🤖 Gemini يفكر..."):
-                result = gemini_chat(prompt, st.session_state.chat_history)
-                if result["success"]:
-                    st.session_state.chat_history.append({
-                        "user": user_msg, "ai": result["response"],
-                        "source": result["source"],
-                        "ts": datetime.now().strftime("%H:%M")
-                    })
+                _res = gemini_chat(_full, st.session_state.chat_history)
+            if _res["success"]:
+                st.session_state.chat_history.append({
+                    "user": _msg_to_send, "ai": _res["response"],
+                    "source": _res.get("source","Gemini"),
+                    "ts": datetime.now().strftime("%H:%M")
+                })
+                st.rerun()
+            else:
+                st.error(_res["response"])
+
+        _dc1, _dc2 = st.columns([4,1])
+        with _dc2:
+            if st.session_state.chat_history:
+                if st.button("🗑️ مسح", key="clr_chat"):
+                    st.session_state.chat_history = []
                     st.rerun()
-                else:
-                    st.error(result["response"])
 
+    # ═══ TAB 2: لصق وتحليل ══════════════════════
     with tab2:
-        st.markdown("**تحقق من تطابق منتجين:**")
-        c1, c2 = st.columns(2)
-        p1 = c1.text_input("منتجنا:", key="v_our")
-        p2 = c2.text_input("المنافس:", key="v_comp")
-        c3, c4 = st.columns(2)
-        pr1 = c3.number_input("سعرنا:", 0.0, key="v_p1")
-        pr2 = c4.number_input("سعر المنافس:", 0.0, key="v_p2")
+        st.markdown("**الصق منتجات أو بيانات أو أوامر — Gemini سيحللها فوراً:**")
 
-        if st.button("🔍 تحقق الآن", key="vbtn"):
-            if p1 and p2:
-                with st.spinner("..."):
-                    r = verify_match(p1, p2, pr1, pr2)
-                    if r["success"]:
-                        col = "🟢" if r.get("match") else "🔴"
-                        st.markdown(f"{col} **{'متطابق' if r.get('match') else 'غير متطابق'}** — "
-                                    f"ثقة: **{r.get('confidence',0)}%**")
-                        st.info(r.get("reason", ""))
-                    else:
-                        st.error("فشل الاتصال")
+        _paste = st.text_area(
+            "الصق هنا:",
+            height=200, key="paste_box",
+            placeholder="""يمكنك لصق:
+• قائمة منتجات من Excel (Ctrl+C ثم Ctrl+V)
+• أوامر: "خفّض كل منتج فرقه أكثر من 30 ريال"
+• CSV مباشرة
+• أي نص تريد تحليله""")
 
+        _pc1, _pc2 = st.columns(2)
+        with _pc1:
+            if st.button("🤖 تحليل بـ Gemini", key="paste_go", type="primary", use_container_width=True):
+                if _paste:
+                    # إضافة سياق البيانات الحالية
+                    _ctx_data = ""
+                    if st.session_state.results:
+                        _r2 = st.session_state.results
+                        _all = _r2.get("all", pd.DataFrame())
+                        if not _all.empty and len(_all) > 0:
+                            cols = [c for c in ["المنتج","السعر","منتج المنافس","سعر المنافس","القرار"] if c in _all.columns]
+                            if cols:
+                                _ctx_data = "\n\nعينة من بيانات التطبيق:\n" + _all[cols].head(15).to_string(index=False)
+                    with st.spinner("🤖 Gemini يحلل..."):
+                        _pr = analyze_paste(_paste, _ctx_data)
+                    st.markdown(f'<div class="ai-box">{_pr["response"]}</div>', unsafe_allow_html=True)
+        with _pc2:
+            if st.button("📊 تحويل لجدول", key="paste_table", use_container_width=True):
+                if _paste:
+                    try:
+                        import io as _io
+                        _df_p = pd.read_csv(_io.StringIO(_paste), sep=None, engine='python')
+                        st.dataframe(_df_p, use_container_width=True)
+                        _csv_p = _df_p.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+                        st.download_button("📄 تحميل CSV", data=_csv_p,
+                            file_name="pasted.csv", mime="text/csv", key="paste_dl")
+                    except:
+                        st.warning("تعذر التحويل لجدول — جرب تنسيق CSV أو TSV")
+
+    # ═══ TAB 3: تحقق منتج ══════════════════════
     with tab3:
-        st.markdown("**بحث في السوق عن سعر منتج:**")
-        prod_search = st.text_input("اسم المنتج:", key="mkt_prod")
-        cur_price   = st.number_input("سعرنا الحالي:", 0.0, key="mkt_price")
-        if st.button("🌐 ابحث في السوق", key="mkt_btn"):
-            if prod_search:
-                with st.spinner("🌐 يبحث..."):
-                    r = search_market_price(prod_search, cur_price)
-                    if r.get("success"):
-                        mp = r.get("market_price", 0)
-                        rng = r.get("price_range", {})
-                        comps = r.get("competitors", [])
-                        rec = r.get("recommendation", "")
-                        st.metric("سعر السوق المقترح", f"{mp:,.0f} ر.س",
-                                  delta=f"{mp-cur_price:+.0f} ر.س")
-                        if comps:
-                            st.markdown("**منافسون في السوق:**")
-                            for c in comps[:5]:
-                                st.markdown(f"🏪 {c.get('name','')}: {c.get('price',0):,.0f} ر.س")
-                        if rec:
-                            st.info(f"💡 {rec}")
+        st.markdown("**تحقق من تطابق منتجين بدقة 100%:**")
+        _vc1, _vc2 = st.columns(2)
+        _vp1 = _vc1.text_input("🏷️ منتجنا:", key="v_our", placeholder="Dior Sauvage EDP 100ml")
+        _vp2 = _vc2.text_input("🏪 المنافس:", key="v_comp", placeholder="ديور سوفاج بارفان 100 مل")
+        _vc3, _vc4 = st.columns(2)
+        _vpr1 = _vc3.number_input("💰 سعرنا:", 0.0, key="v_p1")
+        _vpr2 = _vc4.number_input("💰 سعر المنافس:", 0.0, key="v_p2")
+        if st.button("🔍 تحقق الآن", key="vbtn", type="primary"):
+            if _vp1 and _vp2:
+                with st.spinner("🤖 AI يتحقق..."):
+                    _vr = verify_match(_vp1, _vp2, _vpr1, _vpr2)
+                if _vr["success"]:
+                    _mc = "#00C853" if _vr.get("match") else "#FF1744"
+                    _ml = "✅ متطابقان" if _vr.get("match") else "❌ غير متطابقان"
+                    st.markdown(f'''<div style="background:{_mc}22;border:1px solid {_mc};
+                        border-radius:8px;padding:12px;margin:8px 0">
+                      <div style="color:{_mc};font-weight:800;font-size:1.1rem">{_ml}</div>
+                      <div style="color:#aaa;margin-top:4px">ثقة: <b>{_vr.get("confidence",0)}%</b></div>
+                      <div style="color:#888;font-size:.88rem;margin-top:6px">{_vr.get("reason","")}</div>
+                    </div>''', unsafe_allow_html=True)
+                    if _vr.get("suggestion"):
+                        st.info(f"💡 {_vr['suggestion']}")
+                else:
+                    st.error("فشل الاتصال")
 
+    # ═══ TAB 4: بحث السوق ══════════════════════
     with tab4:
-        st.markdown("**تحليل مجمع بالذكاء الاصطناعي:**")
-        if st.session_state.results:
-            sec = st.selectbox("القسم:", ["price_raise","price_lower","approved","review"], key="bulk_sec")
-            if st.button("🤖 تحليل", key="bulk_btn"):
-                df_sec = st.session_state.results.get(sec, pd.DataFrame())
-                if not df_sec.empty:
+        st.markdown("**ابحث عن سعر السوق الحقيقي لأي منتج:**")
+        _ms1, _ms2 = st.columns([3,1])
+        with _ms1:
+            _mprod = st.text_input("🔎 اسم المنتج:", key="mkt_prod",
+                                    placeholder="Dior Sauvage EDP 100ml")
+        with _ms2:
+            _mcur = st.number_input("💰 سعرنا:", 0.0, key="mkt_price")
+
+        if st.button("🌐 ابحث في السوق", key="mkt_btn", type="primary"):
+            if _mprod:
+                with st.spinner("🌐 Gemini يبحث في السوق..."):
+                    _mr = search_market_price(_mprod, _mcur)
+                if _mr.get("success"):
+                    _mp = _mr.get("market_price", 0)
+                    _rng = _mr.get("price_range", {})
+                    _comps = _mr.get("competitors", [])
+                    _rec = _mr.get("recommendation","")
+                    _diff_v = _mp - _mcur if _mcur > 0 else 0
+                    _diff_c = "#00C853" if _diff_v > 0 else "#FF1744" if _diff_v < 0 else "#888"
+
+                    _src1, _src2 = st.columns(2)
+                    with _src1:
+                        st.metric("💹 سعر السوق", f"{_mp:,.0f} ر.س",
+                                  delta=f"{_diff_v:+.0f} ر.س" if _mcur > 0 else None)
+                    with _src2:
+                        _mn = _rng.get("min",0); _mx = _rng.get("max",0)
+                        st.metric("📊 نطاق السعر", f"{_mn:,.0f} - {_mx:,.0f} ر.س")
+
+                    if _comps:
+                        st.markdown("**🏪 منافسون في السوق:**")
+                        for _c in _comps[:5]:
+                            _cpv = float(_c.get("price",0))
+                            _dv = _cpv - _mcur if _mcur > 0 else 0
+                            st.markdown(
+                                f"• **{_c.get('name','')}**: {_cpv:,.0f} ر.س "
+                                f"({'أعلى' if _dv>0 else 'أقل'} بـ {abs(_dv):.0f}ر.س)" if _dv != 0 else
+                                f"• **{_c.get('name','')}**: {_cpv:,.0f} ر.س"
+                            )
+                    if _rec:
+                        st.markdown(f'<div class="ai-box">💡 {_rec}</div>', unsafe_allow_html=True)
+
+        # صورة المنتج من Fragrantica
+        with st.expander("🖼️ صورة ومكونات من Fragrantica Arabia", expanded=False):
+            _fprod = st.text_input("اسم العطر:", key="frag_prod",
+                                    placeholder="Dior Sauvage EDP")
+            if st.button("🔍 ابحث في Fragrantica", key="frag_btn"):
+                if _fprod:
+                    with st.spinner("يجلب من Fragrantica Arabia..."):
+                        _fi = fetch_fragrantica_info(_fprod)
+                    if _fi.get("success"):
+                        _fic1, _fic2 = st.columns([1,2])
+                        with _fic1:
+                            _img_url = _fi.get("image_url","")
+                            if _img_url and _img_url.startswith("http"):
+                                st.image(_img_url, width=200, caption=_fprod)
+                            else:
+                                st.markdown(f"[🔗 Fragrantica Arabia]({_FR}/search/?query={_fprod.replace(' ','+')})")
+                        with _fic2:
+                            _top = ", ".join(_fi.get("top_notes",[])[:5])
+                            _mid = ", ".join(_fi.get("middle_notes",[])[:5])
+                            _base = ", ".join(_fi.get("base_notes",[])[:5])
+                            st.markdown(f"""
+🌸 **القمة:** {_top or "—"}
+💐 **القلب:** {_mid or "—"}
+🌿 **القاعدة:** {_base or "—"}
+📝 **{_fi.get('description_ar','')}**""")
+                        if _fi.get("fragrantica_url"):
+                            st.markdown(f"[🌐 صفحة العطر في Fragrantica]({_fi['fragrantica_url']})")
+                    else:
+                        st.info("لم يتم العثور على بيانات — تحقق من اسم العطر")
+
+    # ═══ TAB 5: أوامر مجمعة ════════════════════
+    with tab5:
+        st.markdown("**نفّذ أوامر مجمعة على بياناتك:**")
+        st.caption(f"📊 البيانات: {_ctx_str}")
+
+        _cmd_section = st.selectbox(
+            "اختر القسم:", ["الكل", "سعر أعلى", "سعر أقل", "موافق", "مراجعة", "مفقود"],
+            key="cmd_sec"
+        )
+        _cmd_text = st.text_area(
+            "الأمر أو السؤال:", height=120, key="cmd_area",
+            placeholder="""أمثلة:
+• حلّل المنتجات التي فرقها أكثر من 30 ريال وأعطني توصية
+• رتّب المنتجات حسب الأولوية
+• ما المنتجات التي تحتاج خفض سعر فوري؟
+• أعطني ملخص مقارنة مع المنافسين"""
+        )
+
+        if st.button("⚡ تنفيذ الأمر", key="cmd_run", type="primary"):
+            if _cmd_text and st.session_state.results:
+                _sec_map = {
+                    "سعر أعلى":"price_raise","سعر أقل":"price_lower",
+                    "موافق":"approved","مراجعة":"review","مفقود":"missing"
+                }
+                _df_sec = None
+                if _cmd_section != "الكل":
+                    _k = _sec_map.get(_cmd_section)
+                    _df_sec = st.session_state.results.get(_k, pd.DataFrame())
+                else:
+                    _df_sec = st.session_state.results.get("all", pd.DataFrame())
+
+                if _df_sec is not None and not _df_sec.empty:
+                    _cols = [c for c in ["المنتج","السعر","منتج المنافس","سعر المنافس","القرار","الفرق"] if c in _df_sec.columns]
+                    _sample = _df_sec[_cols].head(25).to_string(index=False) if _cols else ""
+                    _full_cmd = f"""البيانات ({_cmd_section}) - {len(_df_sec)} منتج:
+{_sample}
+
+الأمر: {_cmd_text}"""
+                    with st.spinner("⚡ Gemini ينفذ الأمر..."):
+                        _cr = call_ai(_full_cmd, "general")
+                    st.markdown(f'<div class="ai-box">{_cr["response"]}</div>', unsafe_allow_html=True)
+                else:
                     with st.spinner("🤖"):
-                        items = [{
-                            "our": str(r.get("المنتج","")),
-                            "comp": str(r.get("منتج المنافس","")),
-                            "our_price": safe_float(r.get("السعر",0)),
-                            "comp_price": safe_float(r.get("سعر المنافس",0))
-                        } for _, r in df_sec.head(20).iterrows()]
-                        res = bulk_verify(items, sec)
-                        st.markdown(f'<div class="ai-box">{res["response"]}</div>',
-                                    unsafe_allow_html=True)
+                        _cr = call_ai(f"{_ctx_str}\n\n{_cmd_text}", "general")
+                    st.markdown(f'<div class="ai-box">{_cr["response"]}</div>', unsafe_allow_html=True)
+            elif _cmd_text:
+                with st.spinner("🤖"):
+                    _cr = call_ai(_cmd_text, "general")
+                st.markdown(f'<div class="ai-box">{_cr["response"]}</div>', unsafe_allow_html=True)
 
 
 # ════════════════════════════════════════════════
