@@ -1,141 +1,127 @@
 """
-utils/make_helper.py v20 - Make.com Integration
-✅ دعم "no" (رقم المنتج)
-✅ تنسيق JSON صحيح
-✅ Retry + Timeout
+make_helper.py - أتمتة Make.com v17.0
+- Webhooks أصلية مربوطة مباشرة
+- دوال تصدير لكل قسم
 """
-import requests
-import json
+import requests, json, time
 from datetime import datetime
-
-# هذه الدوال ستُستورد من config.py
-try:
-    from config import WEBHOOK_UPDATE_PRICES, WEBHOOK_NEW_PRODUCTS
-except:
-    WEBHOOK_UPDATE_PRICES = "https://hook.eu2.make.com/99oljy0d6r3chwg6bdfsptcf6bk8htsd"
-    WEBHOOK_NEW_PRODUCTS = "https://hook.eu2.make.com/xvubj23dmpxu8qzilstd25cnumrwtdxm"
+from config import WEBHOOK_UPDATE_PRICES, WEBHOOK_NEW_PRODUCTS
 
 
-def send_price_updates(products):
-    """إرسال تحديثات الأسعار لـ Make.com"""
-    if not products:
-        return {"success": False, "message": "لا توجد منتجات للإرسال"}
-    
+def send_price_updates(products, webhook_url=None):
+    """إرسال تحديثات الأسعار إلى Make.com"""
+    url = webhook_url or WEBHOOK_UPDATE_PRICES
     try:
         payload = {
-            "products": [
-                {
-                    "product_no": str(p.get("معرف_المنتج", p.get("no", ""))),
-                    "name": str(p.get("المنتج", "")),
-                    "current_price": float(p.get("السعر", 0)),
-                    "new_price": float(p.get("سعر المنافس", 0)),
-                    "diff": float(p.get("الفرق", 0)),
-                    "competitor": str(p.get("المنافس", "")),
-                    "action": _get_action(p.get("القرار", "")),
-                }
-                for p in products
-            ],
-            "timestamp": datetime.now().isoformat(),
-            "total": len(products)
+            "type": "price_updates",
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "count": len(products),
+            "products": products
         }
-        
-        resp = requests.post(
-            WEBHOOK_UPDATE_PRICES,
-            json=payload,
-            headers={"Content-Type": "application/json"},
-            timeout=30
-        )
-        
-        if resp.status_code in [200, 201, 202]:
-            return {
-                "success": True,
-                "message": f"✅ تم إرسال {len(products)} منتج لـ Make.com"
-            }
-        else:
-            return {
-                "success": False,
-                "message": f"❌ خطأ: {resp.status_code}"
-            }
+        resp = requests.post(url, json=payload, timeout=15)
+        return {
+            "success": resp.status_code == 200,
+            "status_code": resp.status_code,
+            "message": f"تم إرسال {len(products)} منتج بنجاح" if resp.status_code == 200 else f"خطأ: {resp.status_code}"
+        }
     except Exception as e:
-        return {"success": False, "message": f"❌ خطأ: {str(e)[:100]}"}
+        return {"success": False, "status_code": 0, "message": f"خطأ: {str(e)}"}
 
 
-def send_new_products(products):
-    """إرسال منتجات مفقودة لـ Make.com"""
-    if not products:
-        return {"success": False, "message": "لا توجد منتجات"}
-    
+def send_new_products(products, webhook_url=None):
+    """إرسال منتجات جديدة/مفقودة إلى Make.com"""
+    url = webhook_url or WEBHOOK_NEW_PRODUCTS
     try:
         payload = {
-            "products": [
-                {
-                    "name": str(p.get("منتج المنافس", "")),
-                    "price": float(p.get("سعر المنافس", 0)),
-                    "brand": str(p.get("الماركة", "")),
-                    "competitor": str(p.get("المنافس", "")),
-                }
-                for p in products
-            ],
-            "timestamp": datetime.now().isoformat(),
-            "total": len(products)
+            "type": "new_products",
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "count": len(products),
+            "products": products
         }
-        
-        resp = requests.post(
-            WEBHOOK_NEW_PRODUCTS,
-            json=payload,
-            timeout=30
-        )
-        
-        if resp.status_code in [200, 201, 202]:
-            return {"success": True, "message": f"✅ تم إرسال {len(products)} منتج"}
-        else:
-            return {"success": False, "message": f"❌ خطأ: {resp.status_code}"}
+        resp = requests.post(url, json=payload, timeout=15)
+        return {
+            "success": resp.status_code == 200,
+            "status_code": resp.status_code,
+            "message": f"تم إرسال {len(products)} منتج جديد بنجاح" if resp.status_code == 200 else f"خطأ: {resp.status_code}"
+        }
     except Exception as e:
-        return {"success": False, "message": f"❌ {str(e)[:100]}"}
+        return {"success": False, "status_code": 0, "message": f"خطأ: {str(e)}"}
 
 
-def send_missing_products(products):
-    """نفس send_new_products"""
-    return send_new_products(products)
+def send_missing_products(products, webhook_url=None):
+    """إرسال المنتجات المفقودة إلى Make.com"""
+    url = webhook_url or WEBHOOK_NEW_PRODUCTS
+    try:
+        payload = {
+            "type": "missing_products",
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "count": len(products),
+            "products": products
+        }
+        resp = requests.post(url, json=payload, timeout=15)
+        return {
+            "success": resp.status_code == 200,
+            "status_code": resp.status_code,
+            "message": f"تم إرسال {len(products)} منتج مفقود بنجاح" if resp.status_code == 200 else f"خطأ: {resp.status_code}"
+        }
+    except Exception as e:
+        return {"success": False, "status_code": 0, "message": f"خطأ: {str(e)}"}
 
 
-def send_single_product(product, product_type="update"):
-    """إرسال منتج واحد"""
-    if product_type == "update":
-        return send_price_updates([product])
-    else:
-        return send_new_products([product])
+def send_to_make(data, webhook_type="update"):
+    """دالة عامة للإرسال إلى Make"""
+    if webhook_type == "update":
+        return send_price_updates(data)
+    elif webhook_type in ["new", "missing"]:
+        return send_new_products(data)
+    return {"success": False, "message": "نوع غير معروف"}
+
+
+def send_single_product(product, action="update"):
+    """إرسال منتج واحد إلى Make"""
+    return send_to_make([product], action)
+
+
+def test_webhook(webhook_type="update"):
+    """اختبار اتصال Webhook"""
+    url = WEBHOOK_UPDATE_PRICES if webhook_type == "update" else WEBHOOK_NEW_PRODUCTS
+    try:
+        payload = {"type": "test", "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+        resp = requests.post(url, json=payload, timeout=10)
+        return {
+            "success": resp.status_code == 200,
+            "status_code": resp.status_code,
+            "url": url,
+            "message": "الاتصال ناجح ✅" if resp.status_code == 200 else f"فشل الاتصال: {resp.status_code}"
+        }
+    except Exception as e:
+        return {"success": False, "url": url, "message": f"خطأ: {str(e)}"}
 
 
 def verify_webhook_connection():
-    """اختبار اتصال Make.com"""
-    test = {"test": True, "timestamp": datetime.now().isoformat()}
-    try:
-        r1 = requests.post(WEBHOOK_UPDATE_PRICES, json=test, timeout=10)
-        r2 = requests.post(WEBHOOK_NEW_PRODUCTS, json=test, timeout=10)
-        return {
-            "success": True,
-            "update_prices_ok": r1.status_code in [200, 201, 202],
-            "new_products_ok": r2.status_code in [200, 201, 202]
-        }
-    except:
-        return {"success": False}
+    """التحقق من جميع الاتصالات"""
+    results = {
+        "update_prices": test_webhook("update"),
+        "new_products": test_webhook("new")
+    }
+    results["all_connected"] = all(r["success"] for r in results.values())
+    return results
 
 
 def export_to_make_format(df, section_type="update"):
-    """تحويل DataFrame لتنسيق Make"""
+    """تحويل DataFrame إلى صيغة Make"""
     products = []
     for _, row in df.iterrows():
-        products.append(dict(row))
+        product = {
+            "name": str(row.get("المنتج", "")),
+            "our_price": float(row.get("السعر", 0)),
+            "comp_name": str(row.get("اسم المنافس", "")),
+            "comp_price": float(row.get("أقل سعر منافس", 0)),
+            "diff": float(row.get("الفرق", 0)),
+            "match_score": float(row.get("نسبة التطابق", 0)),
+            "decision": str(row.get("القرار", "")),
+            "brand": str(row.get("الماركة", "")),
+            "competitor": str(row.get("المنافس", ""))
+        }
+        products.append(product)
     return products
-
-
-def _get_action(decision):
-    """تحويل القرار لـ action"""
-    if "أعلى" in decision:
-        return "lower_price"
-    if "أقل" in decision:
-        return "raise_price"
-    if "موافق" in decision:
-        return "keep"
-    return "review"
