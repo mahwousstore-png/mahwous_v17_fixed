@@ -1,28 +1,22 @@
-"""
-app.py — مهووس v21 | نظام مقارنة الأسعار الذكي
-"""
+"""مهووس v21 — نظام التسعير الذكي | الصفحة الرئيسية"""
 import streamlit as st
 
 st.set_page_config(
     page_title="مهووس — تسعير ذكي",
     page_icon="🧪",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state=True,
 )
 
-st.markdown("""
-<style>
-@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Arabic:wght@300;400;500;600;700&display=swap');
-html, body, [class*="css"] { font-family: 'IBM Plex Sans Arabic', sans-serif !important; direction: rtl; }
-.stButton button { border-radius: 8px; font-weight: 600; }
-.stDataFrame { direction: rtl; }
-[data-testid="stSidebar"] { background: #0f172a; }
-[data-testid="stSidebar"] * { color: #e2e8f0 !important; }
-div[data-testid="metric-container"] { background: #1e293b; border-radius: 10px; padding: 12px; }
-</style>
-""", unsafe_allow_html=True)
+from styles import apply
+apply(st)
 
-st.markdown("## 🧪 مهووس v21 — نظام التسعير الذكي")
+try:
+    from config import APP_VERSION
+except Exception:
+    APP_VERSION = "v21"
+
+st.markdown(f"## 🧪 مهووس {APP_VERSION} — نظام التسعير الذكي")
 st.markdown("اختر صفحة من القائمة الجانبية للبدء")
 
 col1, col2, col3 = st.columns(3)
@@ -44,8 +38,7 @@ if "results" in st.session_state and st.session_state.results is not None:
         (c5,"🔵 مفقود عند المنافس")
     ]:
         col.metric(key, dec.get(key, 0))
-    
-    # زر تصدير سريع من الصفحة الرئيسية
+
     from engines.engine import export_excel
     data = export_excel(df)
     st.download_button(
