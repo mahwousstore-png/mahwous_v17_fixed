@@ -1,22 +1,12 @@
-# Secrets - لا ترفعها أبداً!
-.streamlit/secrets.toml
-
-# Python
 __pycache__/
-*.py[cod]
-*.so
-.env
-venv/
-ENV/
-
-# Database
+*.pyc
 *.db
-*.sqlite
-
-# OS
+*.pkl.gz
+.streamlit/secrets.toml
+.env
 .DS_Store
-Thumbs.db
-
-# IDE
-.vscode/
-.idea/
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
